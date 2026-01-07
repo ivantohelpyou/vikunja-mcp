@@ -211,15 +211,22 @@ def delete_project(project_id: int = Field(description="The project ID")) -> str
 
 @mcp.tool()
 def list_tasks(
-    project_id: int = Field(default=None, description="Filter by project ID"),
+    project_id: int = Field(default=None, description="Filter by project ID (required, or use list_all_tasks)"),
     done: bool = Field(default=None, description="Filter by completion status")
 ) -> str:
-    """List tasks, optionally filtered by project or completion status."""
-    if project_id:
-        tasks = _vikunja_request("GET", f"/projects/{project_id}/tasks")
+    """List tasks from a specific project."""
+    if not project_id:
+        # Get tasks from all projects
+        projects = _vikunja_request("GET", "/projects")
+        tasks = []
+        for p in projects:
+            try:
+                project_tasks = _vikunja_request("GET", f"/projects/{p['id']}/tasks")
+                tasks.extend(project_tasks)
+            except:
+                pass  # Skip projects we can't access
     else:
-        # Get all tasks across projects
-        tasks = _vikunja_request("GET", "/tasks/all")
+        tasks = _vikunja_request("GET", f"/projects/{project_id}/tasks")
 
     if done is not None:
         tasks = [t for t in tasks if t.get("done") == done]
