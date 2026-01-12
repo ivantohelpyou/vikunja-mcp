@@ -702,6 +702,30 @@ def list_views(project_id: int = Field(description="Project ID")) -> dict:
 
 
 @mcp.tool()
+def create_view(
+    project_id: int = Field(description="Project ID"),
+    title: str = Field(description="View title"),
+    view_kind: str = Field(description="View type: list, kanban, gantt, or table"),
+    filter_query: str = Field(default="", description="Optional filter (e.g., 'done = false')")
+) -> dict:
+    """Create a new view for a project."""
+    data = {
+        "title": title,
+        "view_kind": view_kind,
+        "project_id": project_id,
+    }
+    if filter_query:
+        data["filter"] = filter_query
+    view = _request("PUT", f"/projects/{project_id}/views", json=data)
+    return {
+        "id": view["id"],
+        "title": view.get("title", ""),
+        "view_kind": view.get("view_kind", ""),
+        "project_id": project_id
+    }
+
+
+@mcp.tool()
 def get_kanban_view(project_id: int = Field(description="Project ID")) -> dict:
     """Get the kanban view for a project."""
     views = _request("GET", f"/projects/{project_id}/views")
