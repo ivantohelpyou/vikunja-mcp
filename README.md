@@ -4,11 +4,18 @@ MCP server that gives Claude full access to your [Vikunja](https://vikunja.io) t
 
 Works with **any Vikunja instance** — self-hosted, cloud, or [Factumerit](https://factumerit.com).
 
+## Features
+
+- **Multi-instance support** — Connect multiple Vikunja accounts (personal, work, etc.)
+- **Power queries** — "What's overdue?", "Focus mode", "Due this week"
+- **X-Q (Exchange Queue)** — Hand off tasks between Claude Desktop and Claude Code
+- **Full Vikunja API** — Projects, tasks, labels, kanban boards, relations
+
 ## Quick Start (Factumerit Users)
 
 If you're using Factumerit's hosted Vikunja, the setup is automatic:
 
-1. Your welcome message contains the complete config — just copy it
+1. Your welcome email contains the complete config — just copy it
 2. Paste into your Claude Desktop config file (see [Config File Location](#config-file-location))
 3. [Restart Claude Desktop](#restarting-claude-desktop)
 4. Ask Claude: *"What's on my todo list?"*
@@ -39,12 +46,13 @@ Give it a name (e.g., "Claude Desktop") and grant all permissions.
 
 Add to your Claude Desktop config file:
 
+**Single instance:**
 ```json
 {
   "mcpServers": {
     "vikunja": {
       "command": "uvx",
-      "args": ["vikunja-mcp"],
+      "args": ["vikunja-mcp@latest"],
       "env": {
         "VIKUNJA_URL": "https://your-vikunja-instance.com",
         "VIKUNJA_TOKEN": "your-api-token"
@@ -53,6 +61,24 @@ Add to your Claude Desktop config file:
   }
 }
 ```
+
+**Multiple instances:**
+```json
+{
+  "mcpServers": {
+    "vikunja": {
+      "command": "uvx",
+      "args": ["vikunja-mcp@latest"],
+      "env": {
+        "VIKUNJA_INSTANCES": "[{\"name\": \"personal\", \"url\": \"https://vikunja.example.com\", \"token\": \"tk_xxx\"}, {\"name\": \"work\", \"url\": \"https://app.vikunja.cloud\", \"token\": \"tk_yyy\"}]",
+        "VIKUNJA_DEFAULT_INSTANCE": "personal"
+      }
+    }
+  }
+}
+```
+
+> **Tip:** Use `vikunja-mcp@latest` to always get the newest version.
 
 ### Config File Location
 
@@ -70,10 +96,7 @@ Add to your Claude Desktop config file:
 
 **Windows:** Either:
 - Close Claude, open Task Manager (Ctrl+Shift+Esc), end any "Claude" processes, reopen
-- Or use our [restart script](scripts/restart-claude.ps1):
-  ```powershell
-  .\scripts\restart-claude.ps1
-  ```
+- Or run: `uv cache prune` then reopen Claude
 
 **Linux:** Close and reopen the app
 
@@ -85,6 +108,22 @@ Ask Claude:
 If it works, you'll see your projects listed!
 
 ## Available Tools
+
+### Power Queries (Fast)
+- `focus_now` — High priority + overdue tasks (best for "what should I work on?")
+- `due_today` — Tasks due today + overdue
+- `due_this_week` — Tasks due in 7 days
+- `overdue_tasks` — Past-due tasks only
+- `high_priority_tasks` — Priority 3+ tasks
+- `urgent_tasks` — Priority 4+ (critical) tasks
+- `unscheduled_tasks` — Tasks without due dates
+- `task_summary` — Quick counts (no task details)
+
+### Instance Management
+- `list_instances` — Show all configured instances
+- `switch_instance` — Change active instance
+- `get_active_context` / `set_active_context` — Get/set default instance
+- `connect_instance` — Add a new instance
 
 ### Projects
 - `list_projects` — List all projects
@@ -113,18 +152,32 @@ If it works, you'll see your projects listed!
 - `list_buckets` — List kanban columns
 - `create_bucket` — Create new kanban column
 
+### Views
+- `list_views` — List views for a project
+- `create_view` — Create list/kanban/gantt/table view
+- `get_view_tasks` — Get tasks via a specific view
+
 ### Relations
 - `create_task_relation` — Link tasks (blocking, subtask, etc.)
 - `list_task_relations` — List task dependencies
+
+### X-Q (Exchange Queue)
+- `check_xq` — Check for pending handoff items
+- `setup_xq` — Initialize X-Q project with proper buckets
+- `claim_xq_task` — Claim a task for processing
+- `complete_xq_task` — Mark task as filed with destination
 
 ## Usage Examples
 
 Once configured, just ask Claude:
 
+- *"What needs my attention?"* (uses focus_now)
+- *"What's due this week?"*
 - *"Show me all my tasks due this week"*
 - *"Create a task to review the Q4 report in the Work project"*
 - *"What's blocking the website redesign task?"*
 - *"Move the 'Fix login bug' task to the Done column"*
+- *"Switch to my work instance"*
 - *"List all high-priority tasks across all projects"*
 
 ## Troubleshooting
@@ -151,11 +204,15 @@ Your API token may have expired or been revoked. Create a new one in Vikunja Set
 
 ### Windows: Claude won't restart properly
 
-Use Task Manager (Ctrl+Shift+Esc) to ensure all Claude processes are ended before reopening.
+Use Task Manager (Ctrl+Shift+Esc) to ensure all Claude processes are ended before reopening. Or run `uv cache prune` to clear cached environments.
+
+### Not getting latest version
+
+Use `vikunja-mcp@latest` in your args, and run `uv cache prune` after closing Claude Desktop.
 
 ## Requirements
 
-- Python 3.12+ (installed automatically by uv)
+- Python 3.10+ (installed automatically by uv)
 - A Vikunja instance with API access
 - Claude Desktop (or any MCP-compatible client)
 

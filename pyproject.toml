@@ -1,6 +1,6 @@
 [project]
 name = "vikunja-mcp"
-version = "0.7.1"
+version = "0.8.1"
 description = "MCP server for Vikunja task management"
 readme = "README.md"
 license = {text = "MIT"}
@@ -24,6 +24,7 @@ dependencies = [
     "fastmcp>=0.4.0",
     "requests>=2.31.0",
     "pydantic>=2.0",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]

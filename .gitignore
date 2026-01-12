@@ -43,3 +43,7 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local config (contains tokens)
+claude_desktop_config.json
+run-mcp.sh
