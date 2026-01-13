@@ -753,10 +753,11 @@ def set_task_position(
     }
     _request("POST", f"/projects/{project_id}/views/{view_id}/buckets/{bucket_id}/tasks", json=bucket_data)
 
-    # Call 2: CRITICAL - Commit the bucket assignment
+    # Call 2: CRITICAL - Commit the bucket assignment (bucket_id required!)
     position_data = {
         "project_view_id": view_id,
-        "task_id": task_id
+        "task_id": task_id,
+        "bucket_id": bucket_id
     }
     _request("POST", f"/tasks/{task_id}/position", json=position_data)
 
@@ -1208,10 +1209,11 @@ def claim_xq_task(
                 "project_view_id": kanban_info["view_id"],
                 "project_id": project_id
             })
-    # CRITICAL: Commit the bucket assignment
+    # CRITICAL: Commit the bucket assignment (bucket_id required!)
     _request("POST", f"/tasks/{task_id}/position", instance=instance, json={
         "project_view_id": kanban_info["view_id"],
-        "task_id": task_id
+        "task_id": task_id,
+        "bucket_id": review_bucket
     })
 
     return {
@@ -1264,10 +1266,11 @@ def complete_xq_task(
                 "project_view_id": kanban_info["view_id"],
                 "project_id": project_id
             })
-    # CRITICAL: Commit the bucket assignment
+    # CRITICAL: Commit the bucket assignment (bucket_id required!)
     _request("POST", f"/tasks/{task_id}/position", instance=instance, json={
         "project_view_id": kanban_info["view_id"],
-        "task_id": task_id
+        "task_id": task_id,
+        "bucket_id": filed_bucket
     })
 
     return {
@@ -1582,10 +1585,11 @@ def batch_create_tasks(
                 }
                 _request("POST", f"/projects/{project_id}/views/{bucket_info['view_id']}/buckets/{bucket_info['id']}/tasks",
                         json=bucket_data)
-                # Call 2: CRITICAL - Commit the bucket assignment
+                # Call 2: CRITICAL - Commit the bucket assignment (bucket_id required!)
                 position_data = {
                     "project_view_id": bucket_info["view_id"],
-                    "task_id": task_id
+                    "task_id": task_id,
+                    "bucket_id": bucket_info["id"]
                 }
                 _request("POST", f"/tasks/{task_id}/position", json=position_data)
 
@@ -1787,8 +1791,8 @@ def bulk_set_task_positions(
         try:
             _request("POST", f"/projects/{project_id}/views/{view_id}/buckets/{bucket_id}/tasks",
                     json={"task_id": task_id, "bucket_id": bucket_id, "project_view_id": view_id, "project_id": project_id})
-            # CRITICAL: Commit the bucket assignment
-            _request("POST", f"/tasks/{task_id}/position", json={"project_view_id": view_id, "task_id": task_id})
+            # CRITICAL: Commit the bucket assignment (bucket_id required!)
+            _request("POST", f"/tasks/{task_id}/position", json={"project_view_id": view_id, "task_id": task_id, "bucket_id": bucket_id})
             result["moved_count"] += 1
             result["tasks"].append({"task_id": task_id, "bucket_id": bucket_id, "success": True})
         except Exception as e:
@@ -2098,8 +2102,8 @@ def move_tasks_by_label(
             try:
                 _request("POST", f"/projects/{project_id}/views/{view_id}/buckets/{bucket_id}/tasks",
                         json={"task_id": task["id"], "bucket_id": bucket_id, "project_view_id": view_id, "project_id": project_id})
-                # CRITICAL: Commit the bucket assignment
-                _request("POST", f"/tasks/{task['id']}/position", json={"project_view_id": view_id, "task_id": task["id"]})
+                # CRITICAL: Commit the bucket assignment (bucket_id required!)
+                _request("POST", f"/tasks/{task['id']}/position", json={"project_view_id": view_id, "task_id": task["id"], "bucket_id": bucket_id})
                 result["moved"] += 1
                 result["tasks"].append({"id": task["id"], "title": task.get("title", "")})
             except Exception as e:
@@ -2131,8 +2135,8 @@ def move_tasks_by_label_to_buckets(
                 try:
                     _request("POST", f"/projects/{project_id}/views/{view_id}/buckets/{bucket_id}/tasks",
                             json={"task_id": task["id"], "bucket_id": bucket_id, "project_view_id": view_id, "project_id": project_id})
-                    # CRITICAL: Commit the bucket assignment
-                    _request("POST", f"/tasks/{task['id']}/position", json={"project_view_id": view_id, "task_id": task["id"]})
+                    # CRITICAL: Commit the bucket assignment (bucket_id required!)
+                    _request("POST", f"/tasks/{task['id']}/position", json={"project_view_id": view_id, "task_id": task["id"], "bucket_id": bucket_id})
                     result["moved_count"] += 1
                     result["by_label"][label_title] += 1
                 except Exception as e:
