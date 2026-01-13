@@ -38,9 +38,11 @@ powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | ie
 
 ### 2. Get your Vikunja API token
 
-Go to your Vikunja instance → **Settings** → **API Tokens** → **Create a token**.
+**Easy method (Factumerit):**
+Log in at [mcp.factumerit.app](https://mcp.factumerit.app), register your bot, and get your token via email.
 
-Give it a name (e.g., "Claude Desktop") and grant all permissions.
+**Self-hosted method:**
+Go to your Vikunja instance → **Settings** → **API Tokens** → **Create a token**. Give it a name (e.g., "Claude Desktop") and grant all permissions.
 
 ### 3. Configure Claude Desktop
 
