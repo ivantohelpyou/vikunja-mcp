@@ -123,7 +123,6 @@ If it works, you'll see your projects listed!
 - `list_instances` — Show all configured instances
 - `switch_instance` — Change active instance
 - `get_active_context` / `set_active_context` — Get/set default instance
-- `connect_instance` — Add a new instance
 
 ### Projects
 - `list_projects` — List all projects
@@ -179,6 +178,55 @@ Once configured, just ask Claude:
 - *"Move the 'Fix login bug' task to the Done column"*
 - *"Switch to my work instance"*
 - *"List all high-priority tasks across all projects"*
+
+## Advanced Configuration
+
+For power users, vikunja-mcp supports a YAML config file at `~/.vikunja-mcp/config.yaml` for additional features.
+
+### X-Q (Exchange Queue) Setup
+
+X-Q lets you hand off tasks between Claude Desktop and Claude Code. To enable:
+
+1. Create an X-Q project in your Vikunja instance
+2. Add the project ID to your config:
+
+```yaml
+# ~/.vikunja-mcp/config.yaml
+xq:
+  personal: 47      # X-Q project ID for personal instance
+  work: 14915       # X-Q project ID for work instance
+
+instances:
+  personal:
+    url: https://vikunja.example.com
+    token: tk_xxx
+    admin: true     # Required for setup_xq tool
+  work:
+    url: https://app.vikunja.cloud
+    token: tk_yyy
+    admin: true
+```
+
+3. Use `setup_xq` to create the standard buckets (📬 Handoff, 🔍 Review, ✅ Filed)
+
+### Project Configs
+
+Store per-project settings like default buckets and sort strategies:
+
+```yaml
+projects:
+  '47':
+    instance: personal
+    name: X-Q
+    default_bucket: 📬 Handoff
+  '123':
+    instance: work
+    name: Sprint Board
+    sort_strategy:
+      default: due_date
+      buckets:
+        "In Progress": start_date
+```
 
 ## Troubleshooting
 
