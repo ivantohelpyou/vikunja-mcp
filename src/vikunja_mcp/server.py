@@ -744,13 +744,22 @@ def set_task_position(
     apply_sort: bool = Field(default=False, description="Auto-position by sort strategy")
 ) -> dict:
     """Move a task to a kanban bucket."""
-    data = {
+    # Call 1: Add task to bucket
+    bucket_data = {
         "task_id": task_id,
         "bucket_id": bucket_id,
         "project_view_id": view_id,
         "project_id": project_id
     }
-    _request("POST", f"/projects/{project_id}/views/{view_id}/buckets/{bucket_id}/tasks", json=data)
+    _request("POST", f"/projects/{project_id}/views/{view_id}/buckets/{bucket_id}/tasks", json=bucket_data)
+
+    # Call 2: CRITICAL - Commit the bucket assignment
+    position_data = {
+        "project_view_id": view_id,
+        "task_id": task_id
+    }
+    _request("POST", f"/tasks/{task_id}/position", json=position_data)
+
     return {"task_id": task_id, "bucket_id": bucket_id, "moved": True}
 
 
@@ -1199,6 +1208,11 @@ def claim_xq_task(
                 "project_view_id": kanban_info["view_id"],
                 "project_id": project_id
             })
+    # CRITICAL: Commit the bucket assignment
+    _request("POST", f"/tasks/{task_id}/position", instance=instance, json={
+        "project_view_id": kanban_info["view_id"],
+        "task_id": task_id
+    })
 
     return {
         "claimed": task_id,
@@ -1250,6 +1264,11 @@ def complete_xq_task(
                 "project_view_id": kanban_info["view_id"],
                 "project_id": project_id
             })
+    # CRITICAL: Commit the bucket assignment
+    _request("POST", f"/tasks/{task_id}/position", instance=instance, json={
+        "project_view_id": kanban_info["view_id"],
+        "task_id": task_id
+    })
 
     return {
         "filed": task_id,
@@ -1550,12 +1569,25 @@ def batch_create_tasks(
                         continue
                 _request("PUT", f"/tasks/{task_id}/labels", json={"label_id": existing_labels[label_key]})
 
-            # Move to bucket
+            # Move to bucket (requires two API calls)
             bucket_name = task_input.get("bucket")
             if bucket_name and bucket_name in bucket_map:
                 bucket_info = bucket_map[bucket_name]
+                # Call 1: Add task to bucket
+                bucket_data = {
+                    "task_id": task_id,
+                    "bucket_id": bucket_info["id"],
+                    "project_view_id": bucket_info["view_id"],
+                    "project_id": project_id
+                }
                 _request("POST", f"/projects/{project_id}/views/{bucket_info['view_id']}/buckets/{bucket_info['id']}/tasks",
-                        json={"task_id": task_id, "bucket_id": bucket_info["id"]})
+                        json=bucket_data)
+                # Call 2: CRITICAL - Commit the bucket assignment
+                position_data = {
+                    "project_view_id": bucket_info["view_id"],
+                    "task_id": task_id
+                }
+                _request("POST", f"/tasks/{task_id}/position", json=position_data)
 
             result["created"] += 1
             result["tasks"].append({"ref": ref, "id": task_id, "title": task_input["title"]})
@@ -1754,7 +1786,9 @@ def bulk_set_task_positions(
 
         try:
             _request("POST", f"/projects/{project_id}/views/{view_id}/buckets/{bucket_id}/tasks",
-                    json={"task_id": task_id, "bucket_id": bucket_id})
+                    json={"task_id": task_id, "bucket_id": bucket_id, "project_view_id": view_id, "project_id": project_id})
+            # CRITICAL: Commit the bucket assignment
+            _request("POST", f"/tasks/{task_id}/position", json={"project_view_id": view_id, "task_id": task_id})
             result["moved_count"] += 1
             result["tasks"].append({"task_id": task_id, "bucket_id": bucket_id, "success": True})
         except Exception as e:
@@ -2046,7 +2080,9 @@ def move_tasks_by_label(
         if label_filter.lower() in " ".join(task_labels):
             try:
                 _request("POST", f"/projects/{project_id}/views/{view_id}/buckets/{bucket_id}/tasks",
-                        json={"task_id": task["id"], "bucket_id": bucket_id})
+                        json={"task_id": task["id"], "bucket_id": bucket_id, "project_view_id": view_id, "project_id": project_id})
+                # CRITICAL: Commit the bucket assignment
+                _request("POST", f"/tasks/{task['id']}/position", json={"project_view_id": view_id, "task_id": task["id"]})
                 result["moved"] += 1
                 result["tasks"].append({"id": task["id"], "title": task.get("title", "")})
             except Exception as e:
@@ -2077,7 +2113,9 @@ def move_tasks_by_label_to_buckets(
             if label_lower in task_labels:
                 try:
                     _request("POST", f"/projects/{project_id}/views/{view_id}/buckets/{bucket_id}/tasks",
-                            json={"task_id": task["id"], "bucket_id": bucket_id})
+                            json={"task_id": task["id"], "bucket_id": bucket_id, "project_view_id": view_id, "project_id": project_id})
+                    # CRITICAL: Commit the bucket assignment
+                    _request("POST", f"/tasks/{task['id']}/position", json={"project_view_id": view_id, "task_id": task["id"]})
                     result["moved_count"] += 1
                     result["by_label"][label_title] += 1
                 except Exception as e:
