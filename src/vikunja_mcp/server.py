@@ -1821,6 +1821,7 @@ def setup_kanban_board(
     """Rapid kanban board setup with templates.
 
     Templates: gtd, sprint, kitchen, simple, custom
+    Idempotent: safe to call multiple times without creating duplicates.
     """
     # Get or create project
     if project_title and not project_id:
@@ -1830,48 +1831,64 @@ def setup_kanban_board(
     else:
         created_project = False
 
-    # Get bucket list
+    # Get bucket config from template
     if template == "custom" and custom_buckets:
         bucket_names = custom_buckets
     else:
         bucket_names = KANBAN_TEMPLATES.get(template, KANBAN_TEMPLATES["gtd"])
 
-    # Create kanban view
-    view = _request("PUT", f"/projects/{project_id}/views", json={
-        "title": view_title,
-        "view_kind": "kanban",
-        "project_id": project_id
-    })
+    # Get or create kanban view (idempotent - reuse existing by title)
+    views = _request("GET", f"/projects/{project_id}/views")
+    kanban_views = [v for v in views if v.get("view_kind") == "kanban" and v.get("title") == view_title]
+
+    if kanban_views:
+        view = kanban_views[0]  # Reuse existing
+        view_existed = True
+    else:
+        view = _request("PUT", f"/projects/{project_id}/views", json={
+            "title": view_title,
+            "view_kind": "kanban",
+            "bucket_configuration_mode": "manual"
+        })
+        view_existed = False
     view_id = view["id"]
 
-    # Get existing buckets (Vikunja auto-creates some)
+    # Get existing buckets and create map by title (idempotent bucket creation)
     existing_buckets = _request("GET", f"/projects/{project_id}/views/{view_id}/buckets")
-    existing_titles = {b["title"] for b in existing_buckets}
+    existing_bucket_map = {b["title"]: b for b in existing_buckets}
 
-    # Delete default buckets if requested
-    if delete_default_buckets:
-        for bucket in existing_buckets:
-            if bucket["title"] in ["Backlog", "To-Do", "Doing", "Done"]:
-                try:
-                    _request("DELETE", f"/projects/{project_id}/views/{view_id}/buckets/{bucket['id']}")
-                except:
-                    pass
-
-    # Create buckets
+    # Create buckets (idempotent - reuse existing by title)
     created_buckets = []
     for i, name in enumerate(bucket_names):
-        if name not in existing_titles:
+        if name in existing_bucket_map:
+            bucket = existing_bucket_map[name]  # Reuse existing
+        else:
             bucket = _request("PUT", f"/projects/{project_id}/views/{view_id}/buckets",
                             json={"title": name, "position": i * 1000})
-            created_buckets.append({"id": bucket["id"], "title": name})
+        created_buckets.append({"id": bucket["id"], "title": bucket["title"]})
+
+    # Delete default buckets AFTER template buckets exist
+    buckets_deleted = 0
+    if delete_default_buckets:
+        all_buckets = _request("GET", f"/projects/{project_id}/views/{view_id}/buckets")
+        created_bucket_ids = {b["id"] for b in created_buckets}
+        for bucket in all_buckets:
+            if bucket["id"] not in created_bucket_ids:
+                try:
+                    _request("DELETE", f"/projects/{project_id}/views/{view_id}/buckets/{bucket['id']}")
+                    buckets_deleted += 1
+                except:
+                    pass
 
     return {
         "project_id": project_id,
         "project_created": created_project,
         "view_id": view_id,
         "view_title": view_title,
-        "buckets_created": len(created_buckets),
-        "buckets": created_buckets
+        "view_existed": view_existed,
+        "buckets_created": len([b for b in created_buckets if b["title"] not in existing_bucket_map]),
+        "buckets": created_buckets,
+        "buckets_deleted": buckets_deleted
     }
 
 
