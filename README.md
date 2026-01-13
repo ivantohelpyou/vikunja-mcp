@@ -39,7 +39,7 @@ powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | ie
 ### 2. Get your Vikunja API token
 
 **Easy method (Factumerit):**
-Log in at [mcp.factumerit.app](https://mcp.factumerit.app), register your bot, and get your token via email. (Beta registration token required — [join waiting list](https://mcp.factumerit.app/waiting-list?source=factumerit.com) if you don't have one)
+Log in at [mcp.factumerit.app](https://mcp.factumerit.app), register your bot, and get your token via email. (Beta registration token required — [join waiting list](https://mcp.factumerit.app/waiting-list?source=github) if you don't have one)
 
 **Self-hosted method:**
 Go to your Vikunja instance → **Settings** → **API Tokens** → **Create a token**. Give it a name (e.g., "Claude Desktop") and grant all permissions.
