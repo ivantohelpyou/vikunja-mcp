@@ -816,6 +816,51 @@ def list_task_relations(task_id: int = Field(description="Task ID")) -> dict:
 # POWER QUERY TOOLS - Fast task queries across instances
 # ============================================================================
 
+def _get_project_tasks_via_view(project_id: int, instance: str = "") -> list:
+    """Fetch all tasks for a project using the view-based API endpoint.
+
+    Vikunja's legacy /projects/{id}/tasks endpoint only returns tasks that are
+    in the project's default view, silently omitting tasks added via other views
+    or the Kanban board. The correct endpoint is
+    /projects/{id}/views/{view_id}/tasks, which returns every task in the view.
+
+    Prefers the first list/gantt/table view (returns a flat task array). Falls
+    back to kanban (flattens buckets) and then to the legacy endpoint if no
+    views are configured.
+    """
+    try:
+        views = _request("GET", f"/projects/{project_id}/views", instance=instance) or []
+    except Exception:
+        views = []
+
+    if not views:
+        try:
+            return _request("GET", f"/projects/{project_id}/tasks", instance=instance) or []
+        except Exception:
+            return []
+
+    # Prefer a flat-returning view; kanban needs special handling
+    chosen = next(
+        (v for v in views if v.get("view_kind") in ("list", "gantt", "table")),
+        views[0]
+    )
+
+    try:
+        raw = _request("GET", f"/projects/{project_id}/views/{chosen['id']}/tasks", instance=instance) or []
+    except Exception:
+        return []
+
+    if chosen.get("view_kind") == "kanban":
+        flat = []
+        for bucket in raw:
+            for t in (bucket.get("tasks") or []):
+                t["bucket_id"] = bucket.get("id")
+                flat.append(t)
+        return flat
+
+    return raw
+
+
 def _get_all_tasks(instance: str = "") -> list:
     """Get all incomplete tasks from all projects."""
     instances = _get_instances()
@@ -828,7 +873,7 @@ def _get_all_tasks(instance: str = "") -> list:
             projects = _request("GET", "/projects", instance=inst_name)
             for proj in projects:
                 try:
-                    tasks = _request("GET", f"/projects/{proj['id']}/tasks", instance=inst_name)
+                    tasks = _get_project_tasks_via_view(proj["id"], instance=inst_name)
                     for t in tasks:
                         if not t.get("done"):
                             t["_instance"] = inst_name
@@ -2406,7 +2451,7 @@ def list_all_tasks(
             instance_tasks = []
 
             for project in projects:
-                tasks = _request("GET", f"/projects/{project['id']}/tasks", instance=name)
+                tasks = _get_project_tasks_via_view(project["id"], instance=name)
                 for task in tasks:
                     if not include_done and task.get("done"):
                         continue
@@ -2479,7 +2524,7 @@ def search_all(
                     })
 
                 # Search tasks in project
-                tasks = _request("GET", f"/projects/{p['id']}/tasks", instance=name)
+                tasks = _get_project_tasks_via_view(p["id"], instance=name)
                 for t in tasks:
                     if query_lower in t.get("title", "").lower():
                         matches.append({
