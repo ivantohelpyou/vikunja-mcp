@@ -553,6 +553,23 @@ def create_task(
     return {"id": task["id"], "title": task.get("title"), "project_id": project_id}
 
 
+def _patch_task(task_id: int, changes: dict, instance: Optional[str] = None) -> dict:
+    """Apply a partial update to a task using read-modify-write.
+
+    Vikunja's ``POST /tasks/{id}`` replaces the entire task: any field absent
+    from the request body is reset to its zero value (empty description, priority
+    0, no due date, etc.). Sending only the changed fields therefore silently
+    wipes everything else. To apply a safe partial update we fetch the current
+    task, overlay the requested changes, drop server-managed read-only fields,
+    and send the full object back.
+    """
+    current = _request("GET", f"/tasks/{task_id}", instance=instance)
+    current.update(changes)
+    for read_only in ("created", "updated"):
+        current.pop(read_only, None)
+    return _request("POST", f"/tasks/{task_id}", instance=instance, json=current)
+
+
 @mcp.tool()
 def update_task(
     task_id: int = Field(description="Task ID"),
@@ -565,36 +582,41 @@ def update_task(
     repeat_after: int = Field(default=-1, description="Repeat interval (-1=keep, 0=disable)"),
     repeat_mode: int = Field(default=-1, description="Repeat mode")
 ) -> dict:
-    """Update an existing task."""
-    data = {}
-    if title:
-        data["title"] = title
-    if description:
-        data["description"] = description
-    if due_date:
-        data["due_date"] = due_date if "T" in due_date else f"{due_date}T00:00:00Z"
-    if start_date:
-        data["start_date"] = start_date if "T" in start_date else f"{start_date}T00:00:00Z"
-    if end_date:
-        data["end_date"] = end_date if "T" in end_date else f"{end_date}T23:59:00Z"
-    if priority >= 0:
-        data["priority"] = priority
-    if repeat_after >= 0:
-        data["repeat_after"] = repeat_after
-    if repeat_mode >= 0:
-        data["repeat_mode"] = repeat_mode
+    """Update an existing task.
 
-    if not data:
+    Only the fields you pass are changed; everything else on the task is
+    preserved (read-modify-write). An empty string / negative sentinel means
+    "leave this field unchanged".
+    """
+    changes = {}
+    if title:
+        changes["title"] = title
+    if description:
+        changes["description"] = description
+    if due_date:
+        changes["due_date"] = due_date if "T" in due_date else f"{due_date}T00:00:00Z"
+    if start_date:
+        changes["start_date"] = start_date if "T" in start_date else f"{start_date}T00:00:00Z"
+    if end_date:
+        changes["end_date"] = end_date if "T" in end_date else f"{end_date}T23:59:00Z"
+    if priority >= 0:
+        changes["priority"] = priority
+    if repeat_after >= 0:
+        changes["repeat_after"] = repeat_after
+    if repeat_mode >= 0:
+        changes["repeat_mode"] = repeat_mode
+
+    if not changes:
         return {"error": "No changes specified"}
 
-    task = _request("POST", f"/tasks/{task_id}", json=data)
+    task = _patch_task(task_id, changes)
     return {"id": task["id"], "title": task.get("title"), "updated": True}
 
 
 @mcp.tool()
 def complete_task(task_id: int = Field(description="Task ID")) -> dict:
     """Mark a task as complete."""
-    task = _request("POST", f"/tasks/{task_id}", json={"done": True})
+    task = _patch_task(task_id, {"done": True})
     return {"id": task_id, "title": task.get("title"), "done": True}
 
 
@@ -1254,10 +1276,10 @@ def complete_xq_task(
     if notes:
         filing += f"\n**Notes:** {notes}"
 
-    _request("POST", f"/tasks/{task_id}", instance=instance, json={
+    _patch_task(task_id, {
         "description": desc + filing,
         "done": True
-    })
+    }, instance=instance)
 
     _request("POST", f"/projects/{project_id}/views/{kanban_info['view_id']}/buckets/{filed_bucket}/tasks",
             instance=instance, json={
