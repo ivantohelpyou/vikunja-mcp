@@ -1,54 +1,149 @@
 # vikunja-mcp
 
-MCP server that gives Claude full access to your [Vikunja](https://vikunja.io) task management instance.
+An MCP server that gives Claude full access to your [Vikunja](https://vikunja.io)
+instance — and, on top of Vikunja's API, a **deterministic engine for deciding what
+to actually do today**.
 
-Works with **any Vikunja instance** — self-hosted, cloud, or [Factumerit](https://factumerit.com).
+Works with any Vikunja instance: self-hosted, cloud, or
+[Factum Erit](https://factumerit.com).
 
-## Features
+---
 
-- **Multi-instance support** — Connect multiple Vikunja accounts (personal, work, etc.)
-- **Power queries** — "What's overdue?", "Focus mode", "Due this week"
-- **X-Q (Exchange Queue)** — Hand off tasks between Claude Desktop and Claude Code
-- **Full Vikunja API** — Projects, tasks, labels, kanban boards, relations
+## Install
 
-## Quick Start (Factumerit Users)
-
-If you're using Factumerit's hosted Vikunja, the setup is automatic:
-
-1. Your welcome email contains the complete config — just copy it
-2. Paste into your Claude Desktop config file (see [Config File Location](#config-file-location))
-3. [Restart Claude Desktop](#restarting-claude-desktop)
-4. Ask Claude: *"What's on my todo list?"*
-
-## Manual Setup
-
-### 1. Install uv
-
-[uv](https://docs.astral.sh/uv/) is a fast Python package manager. Install it once:
-
-**macOS / Linux:**
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
+# Claude Desktop config — see Setup below for the full block
+uvx vikunja-mcp@latest
 ```
 
-**Windows (PowerShell):**
+Requires a Vikunja instance and an API token. Full configuration in [Setup](#setup).
+
+> **Upgrading from 0.9.x?** The tool surface was renamed and the whole `today_*` family
+> is new. See [CHANGELOG.md](CHANGELOG.md) — the old power-query names are gone.
+
+## What this does that a task API doesn't
+
+Vikunja stores tasks. It has no opinion about which of them matters this morning.
+Most "AI task manager" integrations answer *"what should I do today?"* by dumping the
+task list into a model and letting it improvise a ranking — which is unrepeatable, and
+gets more confident as it gets more wrong.
+
+These tools answer it **deterministically**. No LLM in the scoring path.
+
+Every ranked item carries a `why` trace naming the terms that fired — *"12d overdue ·
+door closes in 3d · priority 3"* — so a ranking you disagree with can be argued with
+rather than merely believed.
+
+### `today_actions` — the daily question
+
+Returns scored, clustered candidates under named intents — *Must clear*, *Quick wins*,
+*Move a goal*, *Context batches*, *Been waiting* — each item carrying a numeric `score`
+and a **`why` trace** explaining the score. Same inputs, same output, every time. Local
+timezone throughout.
+
+### `today_apply` / `today_reset` — claiming
+
+`today_apply` is swipe-right: the task is claimed for *your* today and keeps surfacing
+for the rest of your local day. Tomorrow the claim simply stops applying — no label to
+clean up, no nightly sweep to go wrong. `today_reset` clears today's claims early.
+
+### `today_snooze` — deferral that costs something
+
+Swipe-left requires a **reason**. The taxonomy matters: a deferral tagged `dread`
+increments a counter and demands a date; deferrals past a task's `door_closes` are
+rejected outright; the third `dread` defer raises `rule_of_three`. Deferred tasks
+**escalate** on return rather than sinking quietly to the bottom. A bare snooze is
+refused — the old snooze-to-tomorrow, which cost nothing and therefore meant nothing,
+was retired.
+
+### `today_reckoning` — the weekly kill list
+
+Surfaces **only** tasks deferred N+ times (default 3): the chronic avoiders, loudest
+first, each with its defer count, reason, history depth, and next return date.
+
+This is not a to-do list. It exists to kill things. The allowed answers are
+do / shrink / park / kill — deferring again is not among them.
+
+### `triage_park` / `triage_parked` — read the desk, don't organize it
+
+Park a whole speculative project tree aside in one gesture so the work that matters can
+speak. Durable, reversible, per-user; never touches Vikunja, never deletes a task, never
+marks anything done.
+
+### `today_set_weights` / `today_get_weights` — argue with the ranking
+
+If the ordering is wrong for you, retune the scoring weights at runtime — no code
+change, no redeploy. Overrides are per-user and every later deterministic run honors
+them.
+
+---
+
+## Tools
+
+83 tools. Names are namespaced by object, so `task_*`, `project_*`, and so on.
+
+**Today / reckoning** — `today_actions`, `today_apply`, `today_snooze`, `today_reset`,
+`today_reckoning`, `today_set_weights`, `today_get_weights`, `triage_park`,
+`triage_parked`
+
+**Tasks** — `task_query`, `task_list`, `task_get`, `task_create`, `task_update`,
+`task_complete`, `task_delete`, `task_move`, `task_set_position`, `task_set_reminders`,
+`task_add_label`, `task_assign_user`, `task_unassign_user`, `task_create_relation`,
+`task_list_relations`
+
+**Projects** — `project_list`, `project_list_all`, `project_get`, `project_create`,
+`project_update`, `project_delete`, `project_setup`, `project_analyze`,
+`project_create_from_template`, `project_export`, `project_import`
+
+**Batch** — `batch_create_tasks`, `batch_update_tasks`, `batch_relabel`,
+`batch_move_by_label`, `batch_complete_by_label`, `batch_create_labels`,
+`batch_assign_buckets`, `batch_label_to_buckets`, `batch_reorder_tasks`
+
+**Kanban & views** — `kanban_get`, `kanban_setup`, `kanban_list_buckets`,
+`kanban_create_bucket`, `kanban_delete_bucket`, `kanban_sort_bucket`,
+`kanban_tasks_by_bucket`, `view_list`, `view_create`, `view_update`, `view_delete`,
+`view_get_tasks`, `view_set_position`
+
+**Labels** — `label_list`, `label_create`, `label_delete`
+
+**Comments** — `comment_list`, `comment_add`, `comment_update`, `comment_delete`,
+`comment_recent`
+
+**Search** — `search_all`, `search_all_tasks`
+
+**Instances** — `instance_list`, `instance_connect`, `instance_disconnect`,
+`instance_switch`, `instance_rename`, `instance_check_health`, `ctx_get`, `ctx_set`
+
+**Config** — `config_get`, `config_set`, `config_list`, `config_update`, `config_delete`
+
+**Calendar** — `cal_add_event`
+
+**Assignment queue** — `assign_queue`, `assign_apply`
+
+> **Renamed since 0.9.3.** The PyPI release still uses the old flat names. `focus_now`,
+> `due_today`, `due_this_week`, `overdue_tasks`, `high_priority_tasks`, `urgent_tasks`,
+> `unscheduled_tasks` and `task_summary` are all now modes of a single
+> `task_query(query=...)`; `list_tasks` → `task_list`, `create_task` → `task_create`,
+> `list_projects` → `project_list`, and so on.
+
+---
+
+## Setup
+
+Install [uv](https://docs.astral.sh/uv/):
+
+```bash
+# macOS / Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
 ```powershell
+# Windows
 powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
-### 2. Get your Vikunja API token
+Get a Vikunja API token from **Settings → API Tokens → Create a token**, then add to
+your Claude Desktop config:
 
-**Easy method (Factumerit):**
-Log in at [mcp.factumerit.app](https://mcp.factumerit.app), register your bot, and get your token via email. (Beta registration token required — [join waiting list](https://mcp.factumerit.app/waiting-list?source=github) if you don't have one)
-
-**Self-hosted method:**
-Go to your Vikunja instance → **Settings** → **API Tokens** → **Create a token**. Give it a name (e.g., "Claude Desktop") and grant all permissions.
-
-### 3. Configure Claude Desktop
-
-Add to your Claude Desktop config file:
-
-**Single instance:**
 ```json
 {
   "mcpServers": {
@@ -64,214 +159,85 @@ Add to your Claude Desktop config file:
 }
 ```
 
-**Multiple instances:**
+Multiple instances, via `VIKUNJA_INSTANCES` (a JSON array) plus a default:
+
 ```json
-{
-  "mcpServers": {
-    "vikunja": {
-      "command": "uvx",
-      "args": ["vikunja-mcp@latest"],
-      "env": {
-        "VIKUNJA_INSTANCES": "[{\"name\": \"personal\", \"url\": \"https://vikunja.example.com\", \"token\": \"tk_xxx\"}, {\"name\": \"work\", \"url\": \"https://app.vikunja.cloud\", \"token\": \"tk_yyy\"}]",
-        "VIKUNJA_DEFAULT_INSTANCE": "personal"
-      }
-    }
-  }
+"env": {
+  "VIKUNJA_INSTANCES": "[{\"name\":\"personal\",\"url\":\"https://vikunja.example.com\",\"token\":\"tk_xxx\"},{\"name\":\"work\",\"url\":\"https://app.vikunja.cloud\",\"token\":\"tk_yyy\"}]",
+  "VIKUNJA_DEFAULT_INSTANCE": "personal"
 }
 ```
 
-> **Tip:** Use `vikunja-mcp@latest` to always get the newest version.
+> **Tip:** `vikunja-mcp@latest` always resolves to the newest release. After upgrading,
+> quit Claude Desktop fully and run `uv cache prune` if you still see the old tools.
 
-### Config File Location
+| OS | Config file |
+|----|-------------|
+| macOS | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| Windows | `%APPDATA%\Claude\claude_desktop_config.json` |
+| Linux | `~/.config/claude/claude_desktop_config.json` |
 
-| OS | Path |
-|----|------|
-| **macOS** | `~/Library/Application Support/Claude/claude_desktop_config.json` |
-| **Windows** | `%APPDATA%\Claude\claude_desktop_config.json` |
-| **Linux** | `~/.config/claude/claude_desktop_config.json` |
+Then restart Claude Desktop completely — on macOS Cmd+Q and reopen; on Windows end every
+`Claude` process in Task Manager first. Ask *"What projects do I have in Vikunja?"* to
+confirm.
 
-**Tip:** If the file doesn't exist, create it with just the config above.
+### Optional YAML config
 
-### 4. Restart Claude Desktop
-
-**macOS:** Cmd+Q, then reopen
-
-**Windows:** Either:
-- Close Claude, open Task Manager (Ctrl+Shift+Esc), end any "Claude" processes, reopen
-- Or run: `uv cache prune` then reopen Claude
-
-**Linux:** Close and reopen the app
-
-### 5. Test it
-
-Ask Claude:
-> "What projects do I have in Vikunja?"
-
-If it works, you'll see your projects listed!
-
-## Available Tools
-
-### Power Queries (Fast)
-- `focus_now` — High priority + overdue tasks (best for "what should I work on?")
-- `due_today` — Tasks due today + overdue
-- `due_this_week` — Tasks due in 7 days
-- `overdue_tasks` — Past-due tasks only
-- `high_priority_tasks` — Priority 3+ tasks
-- `urgent_tasks` — Priority 4+ (critical) tasks
-- `unscheduled_tasks` — Tasks without due dates
-- `task_summary` — Quick counts (no task details)
-
-### Instance Management
-- `list_instances` — Show all configured instances
-- `switch_instance` — Change active instance
-- `get_active_context` / `set_active_context` — Get/set default instance
-
-### Projects
-- `list_projects` — List all projects
-- `get_project` — Get project details
-- `create_project` — Create new project
-- `delete_project` — Delete project
-
-### Tasks
-- `list_tasks` — List tasks (with filters)
-- `get_task` — Get task details with labels/assignees
-- `create_task` — Create task with title, description, due date, priority
-- `update_task` — Update task fields
-- `complete_task` — Mark task as done
-- `delete_task` — Delete task
-- `set_task_position` — Move task to kanban bucket
-- `add_label_to_task` — Attach label to task
-- `assign_user` / `unassign_user` — Manage task assignments
-
-### Labels
-- `list_labels` — List all labels
-- `create_label` — Create new label with color
-- `delete_label` — Delete label
-
-### Kanban
-- `get_kanban_view` — Get kanban view ID for a project
-- `list_buckets` — List kanban columns
-- `create_bucket` — Create new kanban column
-
-### Views
-- `list_views` — List views for a project
-- `create_view` — Create list/kanban/gantt/table view
-- `get_view_tasks` — Get tasks via a specific view
-
-### Relations
-- `create_task_relation` — Link tasks (blocking, subtask, etc.)
-- `list_task_relations` — List task dependencies
-
-### X-Q (Exchange Queue)
-- `check_xq` — Check for pending handoff items
-- `setup_xq` — Initialize X-Q project with proper buckets
-- `claim_xq_task` — Claim a task for processing
-- `complete_xq_task` — Mark task as filed with destination
-
-## Usage Examples
-
-Once configured, just ask Claude:
-
-- *"What needs my attention?"* (uses focus_now)
-- *"What's due this week?"*
-- *"Show me all my tasks due this week"*
-- *"Create a task to review the Q4 report in the Work project"*
-- *"What's blocking the website redesign task?"*
-- *"Move the 'Fix login bug' task to the Done column"*
-- *"Switch to my work instance"*
-- *"List all high-priority tasks across all projects"*
-
-## Advanced Configuration
-
-For power users, vikunja-mcp supports a YAML config file at `~/.vikunja-mcp/config.yaml` for additional features.
-
-### X-Q (Exchange Queue) Setup
-
-X-Q lets you hand off tasks between Claude Desktop and Claude Code. To enable:
-
-1. Create an X-Q project in your Vikunja instance
-2. Add the project ID to your config:
+`~/.vikunja-mcp/config.yaml` carries per-instance and per-project settings — default
+buckets, sort strategies:
 
 ```yaml
-# ~/.vikunja-mcp/config.yaml
-xq:
-  personal: 47      # X-Q project ID for personal instance
-  work: 14915       # X-Q project ID for work instance
-
 instances:
   personal:
     url: https://vikunja.example.com
     token: tk_xxx
-    admin: true     # Required for setup_xq tool
-  work:
-    url: https://app.vikunja.cloud
-    token: tk_yyy
-    admin: true
-```
 
-3. Use `setup_xq` to create the standard buckets (📬 Handoff, 🔍 Review, ✅ Filed)
-
-### Project Configs
-
-Store per-project settings like default buckets and sort strategies:
-
-```yaml
 projects:
-  '47':
-    instance: personal
-    name: X-Q
-    default_bucket: 📬 Handoff
   '123':
     instance: work
     name: Sprint Board
+    default_bucket: 📝 To Do
     sort_strategy:
       default: due_date
       buckets:
         "In Progress": start_date
 ```
 
+---
+
+## This file is generated
+
+`src/vikunja_mcp/server.py` is extracted from a larger private server, keeping the
+generic Vikunja surface and dropping everything tenant-specific.
+
+**Edits to it are overwritten by the next extraction.** If something in it is wrong,
+please open an issue rather than a PR against that file — the fix has to be made
+upstream and re-extracted. Issues against everything else are normal PRs.
+
 ## Troubleshooting
 
-### "No MCP servers found" or tools not appearing
+**Tools don't appear.** Check the config file is valid JSON, that `uv` is on your PATH,
+and that Claude Desktop was fully quit rather than just closed.
 
-1. Check your config file syntax (valid JSON?)
-2. Ensure `uv` is installed and in your PATH
-3. Restart Claude Desktop completely (see above)
+**"VIKUNJA_URL and VIKUNJA_TOKEN environment variables are required."** The `env` block
+is missing or misspelled.
 
-### "VIKUNJA_URL and VIKUNJA_TOKEN environment variables are required"
+**401 Unauthorized.** The token was revoked or expired — issue a new one.
 
-Your config is missing the `env` section. Make sure it looks like:
-```json
-"env": {
-  "VIKUNJA_URL": "https://...",
-  "VIKUNJA_TOKEN": "tk_..."
-}
-```
-
-### "401 Unauthorized" errors
-
-Your API token may have expired or been revoked. Create a new one in Vikunja Settings → API Tokens.
-
-### Windows: Claude won't restart properly
-
-Use Task Manager (Ctrl+Shift+Esc) to ensure all Claude processes are ended before reopening. Or run `uv cache prune` to clear cached environments.
-
-### Not getting latest version
-
-Use `vikunja-mcp@latest` in your args, and run `uv cache prune` after closing Claude Desktop.
+**Still on an old version.** Use `vikunja-mcp@latest`, then `uv cache prune` with Claude
+Desktop closed.
 
 ## Requirements
 
-- Python 3.10+ (installed automatically by uv)
-- A Vikunja instance with API access
-- Claude Desktop (or any MCP-compatible client)
+Python 3.10+ (uv installs it), a Vikunja instance with API access, and Claude Desktop or
+any MCP-compatible client.
 
 ## Links
 
-- [Vikunja](https://vikunja.io) — The open-source todo app
-- [Factumerit](https://factumerit.com) — Managed Vikunja hosting with AI features
-- [MCP Protocol](https://modelcontextprotocol.io) — Model Context Protocol
-- [uv](https://docs.astral.sh/uv/) — Fast Python package manager
+- [Vikunja](https://vikunja.io) — the open-source todo app underneath
+- [Factum Erit](https://factumerit.com) — managed Vikunja hosting, where these tools run
+- [MCP](https://modelcontextprotocol.io) — the protocol
+- [uv](https://docs.astral.sh/uv/) — the package manager
 
 ## License
 
