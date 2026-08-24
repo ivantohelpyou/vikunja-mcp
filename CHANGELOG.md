@@ -17,23 +17,25 @@ the same ranking every time.
 | Tool | |
 |---|---|
 | `today_actions` | Scored, clustered candidates under named intents, each carrying a `why` trace |
-| `today_apply` | Claim a task for today; the claim expires on its own tomorrow |
 | `today_snooze` | Reason-aware deferral. A reason is required; deferred tasks escalate on return |
-| `today_reset` | Clear today's claims early |
 | `today_reckoning` | Only tasks deferred 3+ times — the chronic avoiders. Exists to kill things |
 | `today_set_weights` / `today_get_weights` | Retune the ranking at runtime, per user, no code change |
 | `triage_park` / `triage_parked` | Sweep a speculative project tree aside, reversibly |
 
-The whole algorithm is documented in [docs/SCORING.md](docs/SCORING.md) — every weight,
-both caps, the door-decay curve, the cluster rules, and worked examples you can
-reproduce.
+`today_apply` and `today_reset` are **not** included: the claim store they write to is
+server-side, so they cannot work in a standalone install. They are tracked for a
+local-store implementation.
+
+Every ranked item carries a `why` trace naming the terms that fired, so an ordering you
+disagree with can be argued with rather than merely believed, and
+`today_set_weights` retunes it at runtime.
 
 ### Added — everything else
 
 Comments (`comment_*`), batch operations (`batch_*`), search (`search_all`,
 `search_all_tasks`), project templates, import/export, per-project config (`config_*`),
 reminders, task moves, an assignment queue, calendar events (`cal_add_event`), and
-instance health checks. **73 tools → 83.**
+instance health checks. **73 tools → 81.**
 
 ### Fixed
 

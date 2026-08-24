@@ -41,12 +41,6 @@ Returns scored, clustered candidates under named intents — *Must clear*, *Quic
 and a **`why` trace** explaining the score. Same inputs, same output, every time. Local
 timezone throughout.
 
-### `today_apply` / `today_reset` — claiming
-
-`today_apply` is swipe-right: the task is claimed for *your* today and keeps surfacing
-for the rest of your local day. Tomorrow the claim simply stops applying — no label to
-clean up, no nightly sweep to go wrong. `today_reset` clears today's claims early.
-
 ### `today_snooze` — deferral that costs something
 
 Swipe-left requires a **reason**. The taxonomy matters: a deferral tagged `dread`
@@ -80,11 +74,10 @@ them.
 
 ## Tools
 
-83 tools. Names are namespaced by object, so `task_*`, `project_*`, and so on.
+81 tools. Names are namespaced by object, so `task_*`, `project_*`, and so on.
 
-**Today / reckoning** — `today_actions`, `today_apply`, `today_snooze`, `today_reset`,
-`today_reckoning`, `today_set_weights`, `today_get_weights`, `triage_park`,
-`triage_parked`
+**Today / reckoning** — `today_actions`, `today_snooze`, `today_reckoning`,
+`today_set_weights`, `today_get_weights`, `triage_park`, `triage_parked`
 
 **Tasks** — `task_query`, `task_list`, `task_get`, `task_create`, `task_update`,
 `task_complete`, `task_delete`, `task_move`, `task_set_position`, `task_set_reminders`,

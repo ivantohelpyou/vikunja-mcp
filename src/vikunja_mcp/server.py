@@ -9123,18 +9123,6 @@ def today_actions(
 
 @mcp.tool()
 @mcp_tool_with_fallback
-def today_apply(
-    task_id: int = Field(description="ID of the task to mark for today"),
-    instance: str = Field(default="", description="Vikunja instance name. Empty = current instance.")
-) -> dict:
-    """Swipe-right "do today": claim the task for today. The task then surfaces in
-    today-actions for the rest of the user's local day; tomorrow the claim simply
-    no longer applies (no label, no reset sweep — today/08 D3)."""
-    return _today_apply_impl(task_id, instance=instance, source="mcp")
-
-
-@mcp.tool()
-@mcp_tool_with_fallback
 def today_snooze(
     task_id: int = Field(description="ID of the task to defer out of today"),
     reason: str = Field(description="Deferral reason (spec 07 taxonomy), REQUIRED (no default): 'dread' (the only true deferral — needs a date), 'blocked', 'too_big', 'wrong_context', 'not_mine'. A deferral must name why — the legacy snooze-to-tomorrow was retired."),
@@ -9171,16 +9159,6 @@ def today_get_weights() -> dict:
     """Show the current today-actions scoring weights: the documented defaults overlaid
     with YOUR saved overrides (per-user; a system/CLI call sees the shared config's)."""
     return {"weights": _today_action_weights(), "defaults": dict(_TODAY_DEFAULT_WEIGHTS)}
-
-
-@mcp.tool()
-@mcp_tool_with_fallback
-def today_reset(
-    instance: str = Field(default="", description="Vikunja instance name. Empty = current instance.")
-) -> dict:
-    """Clear every "do today" claim you made for today on an instance. (There is no
-    scheduled reset — yesterday's claims expire by themselves.) Returns {instance, cleared}."""
-    return _today_reset_impl(instance=instance)
 
 
 @mcp.tool()
