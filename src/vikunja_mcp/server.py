@@ -182,51 +182,42 @@ KANBAN_TEMPLATES = {
 CONFIG_DIR = Path(os.environ.get("VIKUNJA_MCP_CONFIG_DIR", str(Path.home() / ".vikunja-mcp")))
 CONFIG_FILE = CONFIG_DIR / "config.yaml"
 
-mcp = FastMCP(
-    "vikunja",
-    version=_SERVER_VERSION,
-    instructions="""Task and calendar management system. This is the user's primary calendar and task manager.
-
-CALENDAR: Use cal_* tools for all calendar operations. The user's Google Calendar and Outlook
-are connected as external calendars — use cal_schedule() to see their full schedule (Vikunja
-tasks + Google Calendar + Outlook combined). Do NOT look for a separate Google Calendar
-integration. Use cal_add_event() to add events. Use cal_get_url() for subscription URLs.
-
-TIMEZONE: cal_schedule() returns all times ALREADY converted to the user's local timezone.
-Present times exactly as returned — do NOT convert or adjust them. The response includes
-'timezone', 'today', and 'now' fields for context.
+_INSTRUCTIONS = """Task and calendar management system. This is the user's primary calendar and task manager.
 
 TODAY: When the user asks the open-ended daily question — "what should I do today?",
 "what should I work on?", "what's on my plate", "help me plan my day" — call today_actions()
 FIRST. It returns scored, clustered candidate actions (Must clear / Quick wins / Move a goal /
 Context batches / Been waiting), each with a `why` trace, already timezone-correct. Present the
-clusters as-is; do NOT fall back to raw task lists or task_query for this question. Then use
-today_apply(task_id) / today_snooze(task_id) to act on the user's swipe-right / swipe-left
-choices, and today_set_weights() to re-tune ranking if the user says the ordering is off.
+clusters as-is; do NOT fall back to raw task lists or task_query for this question. Use
+today_set_weights() to re-tune the ranking if the user says the ordering is off.
 
-ROUTINES: habits with a quota per day/week ("cardio 3x/week", "calcium every day") are
-Factum Erit-native routine goals, NOT Vikunja tasks. "log cardio", "did yoga yesterday
-(45 min)", "how am I doing this week?", "add a routine" → routine_log / routine_undo /
-routine_status / routine_set. Never create repeating Vikunja tasks for a routine.
+DEFERRAL: "not today" is today_snooze(task_id, reason=...) and a reason is REQUIRED —
+blocked / too_big / wrong_context / not_mine / dread. Only `dread` is a true deferral, and it
+needs a date. Deferred tasks come back LOUDER, never quieter. today_reckoning() surfaces only
+what has been refused three or more times; that list exists to kill things, not to do them.
+triage_park() sweeps a whole speculative project aside, reversibly.
 
 TASKS: Use task_* tools for narrower lookups. For a specific quick query ("what's due today?",
 "what's overdue?", "give me a count"), use task_query(query='today'|'overdue'|'urgent'|'summary').
 Prefer today_actions() over task_query for the broad "what should I do" question above.
 
-INSTANCES: The user has multiple Vikunja instances (e.g., 'personal', 'business'). Each
-project belongs to exactly one instance — use project_list_all() to see which. CRITICAL:
-When writing to a project, you MUST use ctx_set(instance='...') first to switch to the
-correct instance, or pass instance='...' on tools that support it. Using the wrong instance
-token causes 403 Forbidden errors. If you get a 403 on a write, check whether the active
-instance matches the project's instance before retrying.
+INSTANCES: The user may hold more than one Vikunja account (e.g. 'personal', 'business'). Each
+project belongs to exactly one — use project_list_all() to see which. CRITICAL: when writing to
+a project you MUST call ctx_set(instance='...') first, or pass instance='...' on tools that
+support it. Using the wrong instance returns a 403 that looks like an auth failure.
 
-DISCOVERY: Call help() to see all available tool domains. Call cal_help() or task_help()
-for detailed tool listings and common workflows.
+CALENDAR: cal_add_event() places a task on the calendar. Tasks carrying the `calendar` label
+surface in calendar views and ICS feeds.
 
-Tool prefixes: today_, cal_, task_, project_, view_, kanban_, batch_, label_, config_, instance_,
-ctx_, comment_, search_. All tools are in this MCP server — do not look for external calendar
-or task integrations."""
+Tool prefixes: today_, triage_, cal_, task_, project_, view_, kanban_, batch_, label_, config_,
+instance_, ctx_, comment_, search_, assign_."""
+
+mcp = FastMCP(
+    "vikunja",
+    version=_SERVER_VERSION,
+    instructions=_INSTRUCTIONS,
 )
+
 
 _project_instance_cache: dict = {}
 _PROJECT_INSTANCE_CACHE_TTL_SECONDS = 60
