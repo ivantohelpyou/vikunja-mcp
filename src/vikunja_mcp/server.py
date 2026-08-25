@@ -609,8 +609,8 @@ def _get_current_instance() -> Optional[str]:
 
     Priority:
     0. _forced_instance contextvar (explicit instance= arg on a write wrapper)
-    1. mcp_context.instance (set by set_active_context tool)
-    2. current_instance (set by switch_instance or config file)
+    1. mcp_context.instance (set by ctx_set tool)
+    2. current_instance (set by instance_switch or config file)
     3. First configured instance as fallback
     """
     # Request-scoped explicit override wins over the sticky mcp_context default so a
@@ -1448,9 +1448,9 @@ def _create_project_impl_direct(title: str, description: str = "", hex_color: st
         try:
             from .bot_provisioning import grant_project, normalize_vikunja_user_id
             _gr = grant_project(normalize_vikunja_user_id(_grant_hook_uid), new_project_id)
-            logger.info(f"[create_project] fa-s965.2 grant p{new_project_id}: {_gr.get('status')}")
+            logger.info(f"[project_create] fa-s965.2 grant p{new_project_id}: {_gr.get('status')}")
         except Exception as e:
-            logger.warning(f"[create_project] fa-s965.2 grant hook failed for p{new_project_id}: {e}")
+            logger.warning(f"[project_create] fa-s965.2 grant hook failed for p{new_project_id}: {e}")
 
     shared_with = []
 
@@ -1483,7 +1483,7 @@ def _create_project_impl_direct(title: str, description: str = "", hex_color: st
             if bot_creds:
                 bot_username, bot_password = bot_creds
                 bot_token = get_bot_jwt(bot_username, bot_password, os.environ.get("VIKUNJA_URL", "https://vikunja.factumerit.app"))
-                logger.info(f"[create_project] Got bot JWT token for {bot_username}")
+                logger.info(f"[project_create] Got bot JWT token for {bot_username}")
 
             # Get user's JWT token (to create project in user's account)
             # First check personal_bots table (stored during signup)
@@ -1492,7 +1492,7 @@ def _create_project_impl_direct(title: str, description: str = "", hex_color: st
 
             user_token = get_bot_owner_token(user_id_for_lookup)
             if user_token:
-                logger.info(f"[create_project] Using owner token from personal_bots for {requesting_user}")
+                logger.info(f"[project_create] Using owner token from personal_bots for {requesting_user}")
             else:
                 # Fall back to OIDC token
                 try:
@@ -1501,13 +1501,13 @@ def _create_project_impl_direct(title: str, description: str = "", hex_color: st
                         purpose="clone_bot_project",
                         caller="server._create_project_impl"
                     )
-                    logger.info(f"[create_project] Using OIDC token from token_broker for {requesting_user}")
+                    logger.info(f"[project_create] Using OIDC token from token_broker for {requesting_user}")
                 except AuthRequired as e:
-                    logger.info(f"[create_project] User {requesting_user} has no token (not in personal_bots or token_broker), skipping clone: {e}")
+                    logger.info(f"[project_create] User {requesting_user} has no token (not in personal_bots or token_broker), skipping clone: {e}")
                     # Fall through to return bot's project (still works, just not in user's account)
 
             if bot_token and user_token:
-                logger.info(f"[create_project] Cloning bot project {new_project_id} to user {requesting_user}")
+                logger.info(f"[project_create] Cloning bot project {new_project_id} to user {requesting_user}")
 
                 # Clone project from bot's account to user's account
                 result = clone_project_to_user(
@@ -1521,27 +1521,27 @@ def _create_project_impl_direct(title: str, description: str = "", hex_color: st
                 if result["success"]:
                     # Return the user's project instead of bot's project
                     user_project_id = result["user_project_id"]
-                    logger.info(f"[create_project] Successfully cloned: bot#{new_project_id} → user#{user_project_id}")
+                    logger.info(f"[project_create] Successfully cloned: bot#{new_project_id} → user#{user_project_id}")
 
                     # Fetch and return the user's project
                     user_project = _request("GET", f"/api/v1/projects/{user_project_id}")
                     return _format_project(user_project)
                 else:
-                    logger.error(f"[create_project] Clone failed: {result.get('error')}")
+                    logger.error(f"[project_create] Clone failed: {result.get('error')}")
                     # Fall through to return bot's project
             else:
-                logger.info(f"[create_project] Skipping clone (bot_token={bool(bot_token)}, user_token={bool(user_token)})")
+                logger.info(f"[project_create] Skipping clone (bot_token={bool(bot_token)}, user_token={bool(user_token)})")
         except AuthRequired as e:
             # User hasn't authenticated - this is expected for users who haven't done OIDC yet
-            logger.info(f"[create_project] User {requesting_user} not authenticated, skipping clone: {e}")
+            logger.info(f"[project_create] User {requesting_user} not authenticated, skipping clone: {e}")
         except Exception as e:
-            logger.error(f"[create_project] Failed to clone project to user: {e}", exc_info=True)
+            logger.error(f"[project_create] Failed to clone project to user: {e}", exc_info=True)
 
     # Auto-share: If this is a subproject, inherit users from parent
     if parent_project_id and new_project_id:
         try:
             parent_users = _request("GET", f"/api/v1/projects/{parent_project_id}/users")
-            logger.info(f"[create_project] Parent project {parent_project_id} has {len(parent_users)} users: {[u.get('username') for u in parent_users]}")
+            logger.info(f"[project_create] Parent project {parent_project_id} has {len(parent_users)} users: {[u.get('username') for u in parent_users]}")
             for user in parent_users:
                 # NOTE: user.get("id") is the RELATION ID, not user ID!
                 # The actual user_id is excluded from JSON response (json:"-")
@@ -1555,20 +1555,20 @@ def _create_project_impl_direct(title: str, description: str = "", hex_color: st
                         matching = [u for u in user_search if u.get("username", "").lower() == username.lower()]
                         if matching:
                             real_user_id = matching[0]["id"]
-                            logger.info(f"[create_project] Inheriting user {username} (real_id={real_user_id}) from parent")
+                            logger.info(f"[project_create] Inheriting user {username} (real_id={real_user_id}) from parent")
                             _request("PUT", f"/api/v1/projects/{new_project_id}/users", json={
                                 "user_id": str(real_user_id),  # Vikunja expects string
                                 "right": right
                             })
                             shared_with.append(username)
                         else:
-                            logger.warning(f"[create_project] Could not find user {username} via search")
+                            logger.warning(f"[project_create] Could not find user {username} via search")
                     except Exception as e:
-                        logger.warning(f"[create_project] Failed to inherit user {username}: {e}")
+                        logger.warning(f"[project_create] Failed to inherit user {username}: {e}")
             if shared_with:
-                logger.info(f"[create_project] Inherited access from parent: {shared_with}")
+                logger.info(f"[project_create] Inherited access from parent: {shared_with}")
         except Exception as e:
-            logger.warning(f"[create_project] Failed to inherit users from parent: {e}")
+            logger.warning(f"[project_create] Failed to inherit users from parent: {e}")
 
     # Fallback sharing: Share bot's project with requesting user
     # This ensures users can access bot-created projects with admin rights
@@ -1592,17 +1592,17 @@ def _create_project_impl_direct(title: str, description: str = "", hex_color: st
                     if bot_creds:
                         bot_username, bot_password = bot_creds
                         bot_token = get_bot_jwt(bot_username, bot_password, os.environ.get("VIKUNJA_URL", "https://vikunja.factumerit.app"))
-                        logger.info(f"[create_project] Got bot JWT token for sharing: {bot_username}")
+                        logger.info(f"[project_create] Got bot JWT token for sharing: {bot_username}")
 
                 if not bot_token:
-                    logger.warning(f"[create_project] No personal bot found for {requesting_user} - user may be legacy account created before bot provisioning was added. Projects will be created in shared bot account.")
+                    logger.warning(f"[project_create] No personal bot found for {requesting_user} - user may be legacy account created before bot provisioning was added. Projects will be created in shared bot account.")
                 else:
                     vikunja_url = os.environ.get("VIKUNJA_URL", "https://vikunja.factumerit.app")
 
                     # Share project using bot's JWT token (bot owns it)
                     # Use requesting_user (username) - Vikunja API expects "username" field, not "user_id"
                     # See: solutions-2x6i, 111-BOT_PROJECT_SHARING_BUG.md
-                    logger.info(f"[create_project] Sharing project {new_project_id} with user {requesting_user}")
+                    logger.info(f"[project_create] Sharing project {new_project_id} with user {requesting_user}")
                     share_resp = httpx.put(
                         f"{vikunja_url}/api/v1/projects/{new_project_id}/users",
                         headers={"Authorization": f"Bearer {bot_token}"},
@@ -1614,9 +1614,9 @@ def _create_project_impl_direct(title: str, description: str = "", hex_color: st
                     )
                     share_resp.raise_for_status()
                     shared_with.append(requesting_user)
-                    logger.info(f"[create_project] Successfully shared bot project with {requesting_user}")
+                    logger.info(f"[project_create] Successfully shared bot project with {requesting_user}")
             except Exception as e:
-                logger.warning(f"[create_project] Failed to auto-share with {requesting_user}: {e}")
+                logger.warning(f"[project_create] Failed to auto-share with {requesting_user}: {e}")
 
     # Auto-share dispatcher bot (read-only) + personal bot (read/write) with new projects
     # created via MCP server. This enables @mentions and personal bot writes. (fa-n5lm)
@@ -1651,9 +1651,9 @@ def _create_project_impl_direct(title: str, description: str = "", hex_color: st
                             )
                             if resp.status_code != 409:
                                 resp.raise_for_status()
-                            logger.info(f"[create_project] Shared dispatcher (read-only) with project {new_project_id}")
+                            logger.info(f"[project_create] Shared dispatcher (read-only) with project {new_project_id}")
                         except Exception as e:
-                            logger.debug(f"[create_project] Dispatcher share: {e}")
+                            logger.debug(f"[project_create] Dispatcher share: {e}")
 
                     # Share personal bot (read/write) for writing responses
                     personal_vikunja_id = get_user_bot_vikunja_id(user_id_str)
@@ -1667,11 +1667,11 @@ def _create_project_impl_direct(title: str, description: str = "", hex_color: st
                             )
                             if resp.status_code != 409:
                                 resp.raise_for_status()
-                            logger.info(f"[create_project] Shared personal bot (read/write) with project {new_project_id}")
+                            logger.info(f"[project_create] Shared personal bot (read/write) with project {new_project_id}")
                         except Exception as e:
-                            logger.debug(f"[create_project] Personal bot share: {e}")
+                            logger.debug(f"[project_create] Personal bot share: {e}")
         except Exception as e:
-            logger.warning(f"[create_project] Failed to auto-share bots: {e}")
+            logger.warning(f"[project_create] Failed to auto-share bots: {e}")
 
     if shared_with:
         project["shared_with"] = shared_with
@@ -1693,7 +1693,7 @@ def _create_project_impl_queue(title: str, description: str = "", hex_color: str
     - No token expiry issues (uses active session)
     - Bot gets access (user shares back)
 
-    Supports batching: Multiple create_project calls in one LLM turn are
+    Supports batching: Multiple project_create calls in one LLM turn are
     batched into a single queue entry with projects as JSON array.
     """
     # Security: Sanitize title (strip HTML)
@@ -2265,13 +2265,13 @@ def _import_all_projects_impl(export_data: dict, dry_run: bool = False) -> dict:
 @mcp.tool()
 @mcp_tool_with_fallback
 def project_import(
-    export_data: dict = Field(description="Export data from export_all_projects"),
+    export_data: dict = Field(description="Export data from project_export"),
     dry_run: bool = Field(default=False, description="Preview counts without creating anything")
 ) -> dict:
     """
     Import a full project export into the current Vikunja instance.
 
-    Use export_all_projects on the source instance, then switch instances
+    Use project_export on the source instance, then switch instances
     and call this to recreate everything on the target.
 
     Handles: label deduplication, project hierarchy, kanban views/buckets,
@@ -2371,9 +2371,9 @@ def project_update(
     Use position to reorder projects within their parent:
     - -1: Don't change position (default)
     - Lower values appear first in the list
-    - Use list_projects to see current positions
+    - Use project_list to see current positions
 
-    WARNING: Reparenting has known bugs in Vikunja. Back up first with export_all_projects.
+    WARNING: Reparenting has known bugs in Vikunja. Back up first with project_export.
     """
     return _update_project_impl(project_id, title, description, hex_color, parent_project_id, position)
 
@@ -3206,7 +3206,7 @@ def cal_add_event(
     natural language times — e.g., "noon Pacific" = 20:00Z (PST) or 19:00Z (PDT).
     User timezone is stored in config under users.{user_id}.timezone_override.
 
-    Use get_calendar_url to get the subscription URL for Google Calendar/Outlook.
+    Use cal_get_url to get the subscription URL for Google Calendar/Outlook.
     """
     return _add_to_calendar_impl(project_id, title, due_date, description, start_date, end_date, label_name)
 
@@ -3355,14 +3355,14 @@ def task_delete(
 def task_set_position(
     task_id: int = Field(description="ID of the task to move"),
     project_id: int = Field(description="ID of the project containing the task"),
-    view_id: int = Field(description="ID of the kanban view (get from get_kanban_view)"),
-    bucket_id: int = Field(description="ID of the target bucket (get from list_buckets)"),
+    view_id: int = Field(description="ID of the kanban view (get from kanban_get)"),
+    bucket_id: int = Field(description="ID of the target bucket (get from kanban_list_buckets)"),
     apply_sort: bool = Field(default=False, description="If true, calculate correct position based on bucket's sort strategy from project config")
 ) -> dict:
     """
     Move a task to a kanban bucket.
 
-    First use get_kanban_view to get the view_id, then list_buckets to find bucket_id.
+    First use kanban_get to get the view_id, then kanban_list_buckets to find bucket_id.
 
     If apply_sort=True, the task will be positioned according to the bucket's
     sort_strategy from project config (e.g., by start_date). Otherwise, it's
@@ -3375,12 +3375,12 @@ def task_set_position(
 @mcp_tool_with_fallback
 def task_add_label(
     task_id: int = Field(description="ID of the task"),
-    label_id: int = Field(description="ID of the label to add (get from list_labels)")
+    label_id: int = Field(description="ID of the label to add (get from label_list)")
 ) -> dict:
     """
     Add a label to a task.
 
-    Use list_labels to find available label IDs.
+    Use label_list to find available label IDs.
     """
     return _add_label_to_task_impl(task_id, label_id)
 
@@ -3704,7 +3704,7 @@ def _analyze_project_dimensions_impl(project_id: int) -> dict:
             return {
                 "error": f"Project {project_id} not found",
                 "project_id": project_id,
-                "suggestion": "Use list_projects to find valid project IDs"
+                "suggestion": "Use project_list to find valid project IDs"
             }
         raise
 
@@ -3835,7 +3835,7 @@ def project_analyze(
     - suggested_kanbans: Ready-to-use kanban configurations based on actual data
 
     The suggested_kanbans include filter queries you can use directly with
-    create_view and create_bucket to build meaningful views.
+    view_create and kanban_create_bucket to build meaningful views.
     """
     return _analyze_project_dimensions_impl(project_id)
 
@@ -3847,7 +3847,7 @@ def label_list() -> list[dict]:
     List all available labels.
 
     Returns labels with IDs, titles, and colors.
-    Use label IDs with add_label_to_task.
+    Use label IDs with task_add_label.
     """
     return _list_labels_impl()
 
@@ -4670,7 +4670,7 @@ def view_list(
     List all views for a project.
 
     Returns views with IDs, titles, and view_kind (list, kanban, gantt, table).
-    Use view IDs with get_view_tasks to fetch tasks via that view.
+    Use view IDs with view_get_tasks to fetch tasks via that view.
     """
     return _list_views_impl(project_id, instance=instance or None)
 
@@ -4737,14 +4737,14 @@ def view_update(
 @mcp_tool_with_fallback
 def view_get_tasks(
     project_id: int = Field(description="ID of the project"),
-    view_id: int = Field(description="ID of the view (get from list_views)")
+    view_id: int = Field(description="ID of the view (get from view_list)")
 ) -> list[dict]:
     """
     Get tasks via a specific view endpoint.
 
     For kanban views, returns tasks with bucket_id and bucket_title populated.
     For list/gantt views, returns flat task list.
-    Use list_tasks_by_bucket for grouped kanban view.
+    Use kanban_tasks_by_bucket for grouped kanban view.
     """
     return _get_view_tasks_impl(project_id, view_id)
 
@@ -4753,7 +4753,7 @@ def view_get_tasks(
 @mcp_tool_with_fallback
 def kanban_tasks_by_bucket(
     project_id: int = Field(description="ID of the project"),
-    view_id: int = Field(description="ID of the kanban view (get from list_views)")
+    view_id: int = Field(description="ID of the kanban view (get from view_list)")
 ) -> dict:
     """
     Get tasks grouped by kanban bucket.
@@ -4800,13 +4800,13 @@ def kanban_get(
 @mcp_tool_with_fallback
 def kanban_list_buckets(
     project_id: int = Field(description="ID of the project"),
-    view_id: int = Field(description="ID of the view (get from get_kanban_view)")
+    view_id: int = Field(description="ID of the view (get from kanban_get)")
 ) -> list[dict]:
     """
     List all kanban buckets (columns) in a view.
 
     Returns buckets with IDs, titles, positions, and WIP limits.
-    Use bucket IDs with set_task_position to move tasks.
+    Use bucket IDs with task_set_position to move tasks.
     """
     return _list_buckets_impl(project_id, view_id)
 
@@ -4815,7 +4815,7 @@ def kanban_list_buckets(
 @mcp_tool_with_fallback
 def kanban_create_bucket(
     project_id: int = Field(description="ID of the project"),
-    view_id: int = Field(description="ID of the view (get from get_kanban_view)"),
+    view_id: int = Field(description="ID of the view (get from kanban_get)"),
     title: str = Field(description="Bucket/column title"),
     position: int = Field(default=0, description="Sort position (0 = first)"),
     limit: int = Field(default=0, description="WIP limit (0 = no limit)")
@@ -4858,10 +4858,10 @@ def batch_assign_buckets(
     assignments: list[dict] = Field(description="List of {task_id: int, bucket_id: int, position?: float}")
 ) -> dict:
     """
-    Bulk assign tasks to buckets in a kanban view. Much faster than individual set_task_position calls.
+    Bulk assign tasks to buckets in a kanban view. Much faster than individual task_set_position calls.
     
     Example:
-    bulk_set_task_positions(
+    batch_assign_buckets(
         project_id=14259,
         view_id=55017,
         assignments=[
@@ -4962,7 +4962,7 @@ def batch_create_labels(
     Skips labels that already exist (by title). hex_color is optional (defaults to empty).
     
     Example:
-    bulk_create_labels(
+    batch_create_labels(
         labels=[
             {"title": "Easy win", "hex_color": "2ECC71"},
             {"title": "Ask for help", "hex_color": "E74C3C"},
@@ -4979,7 +4979,7 @@ def batch_create_labels(
 @mcp_tool_with_fallback
 def kanban_delete_bucket(
     project_id: int = Field(description="ID of the project"),
-    view_id: int = Field(description="ID of the view (get from get_kanban_view)"),
+    view_id: int = Field(description="ID of the view (get from kanban_get)"),
     bucket_id: int = Field(description="ID of the bucket to delete")
 ) -> dict:
     """
@@ -5610,14 +5610,14 @@ def _batch_set_positions_impl(view_id: int, positions: list[dict]) -> dict:
 @mcp.tool()
 @mcp_tool_with_fallback
 def batch_reorder_tasks(
-    view_id: int = Field(description="ID of the view (get from get_kanban_view)"),
+    view_id: int = Field(description="ID of the view (get from kanban_get)"),
     positions: list[dict] = Field(description="List of {task_id: int, position: float}")
 ) -> dict:
     """
     Reorder tasks within a view by setting their positions in bulk.
 
-    More efficient than calling set_view_position for each task individually.
-    Does NOT move between buckets — use bulk_set_task_positions for that.
+    More efficient than calling task_set_position for each task individually.
+    Does NOT move between buckets — use batch_assign_buckets for that.
 
     Example:
     positions=[
@@ -5722,8 +5722,8 @@ def _sort_bucket_impl(
 @mcp_tool_with_fallback
 def kanban_sort_bucket(
     project_id: int = Field(description="ID of the project"),
-    view_id: int = Field(description="ID of the kanban view (get from get_kanban_view)"),
-    bucket_id: int = Field(description="ID of the bucket to sort (get from list_buckets)"),
+    view_id: int = Field(description="ID of the kanban view (get from kanban_get)"),
+    bucket_id: int = Field(description="ID of the bucket to sort (get from kanban_list_buckets)"),
     sort_by: str = Field(default=None, description="Primary sort field: due_date, start_date, end_date, priority, title, created, position. Overrides config if specified."),
     then_by: str = Field(default=None, description="Secondary sort for ties. E.g., sort_by=due_date, then_by=title for alphabetical within same date.")
 ) -> dict:
@@ -6237,7 +6237,7 @@ def ctx_get() -> dict:
         "url": url,
         "project_id": mcp_context.get("project_id"),
         "available_instances": list(instances.keys()),
-        "hint": "Use set_active_context to change defaults, or pass instance= to individual tools."
+        "hint": "Use ctx_set to change defaults, or pass instance= to individual tools."
     }
 
 
@@ -6391,7 +6391,7 @@ def instance_check_health(
             except ValueError:
                 pass  # Invalid date format, ignore
         else:
-            result["note"] = "No expiration date tracked. Use connect_instance with token_expires to enable expiry warnings."
+            result["note"] = "No expiration date tracked. Use instance_connect with token_expires to enable expiry warnings."
 
     # Test the token by making an API call
     # Use /api/v1/projects instead of /api/v1/user because API tokens may not have user permission
@@ -6684,7 +6684,7 @@ def _list_all_tasks_impl(
     project_id: int = 0,
     include_meta: bool = False
 ) -> dict:
-    """Implementation for list_all_tasks - testable without decorator.
+    """Implementation for search_all_tasks - testable without decorator.
 
     include_meta: when True, each task additionally carries start_date, updated,
     bucket_id, and full labels (id+title+description) for the today-actions scorer
@@ -6716,10 +6716,10 @@ def _list_all_tasks_impl(
     # Using project-specific endpoint is more efficient and avoids delegation limits
     if project_id:
         endpoint = f"/api/v1/projects/{project_id}/tasks"
-        logger.info(f"[list_all_tasks] Using project-specific endpoint: {endpoint}")
+        logger.info(f"[search_all_tasks] Using project-specific endpoint: {endpoint}")
     else:
         endpoint = "/api/v1/tasks"
-        logger.info(f"[list_all_tasks] Using all-tasks endpoint: {endpoint}")
+        logger.info(f"[search_all_tasks] Using all-tasks endpoint: {endpoint}")
 
     # Check if we have configured instances
     instances = _get_instances()
@@ -6771,15 +6771,15 @@ def _list_all_tasks_impl(
     week_end = today_start + timedelta(days=7)
 
     total_fetched = sum(len(d) if isinstance(d, list) else 0 for d in results.values())
-    logger.info(f"[list_all_tasks] QUERY: filter_due={filter_due}, project_id={project_id}, include_done={include_done}")
-    logger.info(f"[list_all_tasks] FETCHED: {total_fetched} total tasks from API")
-    logger.info(f"[list_all_tasks] TIME: now={now}, today_start={today_start}, today_end={today_start.replace(hour=23, minute=59, second=59)}")
+    logger.info(f"[search_all_tasks] QUERY: filter_due={filter_due}, project_id={project_id}, include_done={include_done}")
+    logger.info(f"[search_all_tasks] FETCHED: {total_fetched} total tasks from API")
+    logger.info(f"[search_all_tasks] TIME: now={now}, today_start={today_start}, today_end={today_start.replace(hour=23, minute=59, second=59)}")
 
     # Debug: Log raw results for project-specific queries
     if project_id and total_fetched == 0:
-        logger.warning(f"[list_all_tasks] No tasks returned for project {project_id}!")
-        logger.warning(f"[list_all_tasks] Raw results: {results}")
-        logger.warning(f"[list_all_tasks] Endpoint used: {endpoint}")
+        logger.warning(f"[search_all_tasks] No tasks returned for project {project_id}!")
+        logger.warning(f"[search_all_tasks] Raw results: {results}")
+        logger.warning(f"[search_all_tasks] Endpoint used: {endpoint}")
 
     for instance_name, data in results.items():
         # Filter by instance if specified
@@ -6798,12 +6798,12 @@ def _list_all_tasks_impl(
         for task in data:
             # Skip done tasks unless requested
             if not include_done and task.get("done"):
-                logger.debug(f"[list_all_tasks] Skipping done task #{task.get('id')}")
+                logger.debug(f"[search_all_tasks] Skipping done task #{task.get('id')}")
                 continue
 
             # Filter by project if specified
             if project_id and task.get("project_id") != project_id:
-                logger.debug(f"[list_all_tasks] Skipping task #{task.get('id')} from project {task.get('project_id')} (want {project_id})")
+                logger.debug(f"[search_all_tasks] Skipping task #{task.get('id')} from project {task.get('project_id')} (want {project_id})")
                 continue
 
             due_date_str = task.get("due_date")
@@ -7159,7 +7159,7 @@ def _task_summary_impl(instance: str = "", project_id: int = 0) -> dict:
         "critical": critical,
         "unscheduled": unscheduled,
         "by_instance": result.get("by_instance", {}),
-        "note": "Counts only - use specific tools (overdue_tasks, due_today, etc.) for details"
+        "note": "Counts only - use task_query(query='overdue'|'today'|'week') for details"
     }
 
 
@@ -9405,7 +9405,7 @@ def ctx_set(
         "instance": mcp_context.get("instance"),
         "project_id": mcp_context.get("project_id"),
         "available_instances": list(instances.keys()),
-        "hint": "Use set_active_context to change defaults, or pass instance= to individual tools."
+        "hint": "Use ctx_set to change defaults, or pass instance= to individual tools."
     }
 
 

@@ -45,11 +45,12 @@ instance health checks. **73 tools → 81.**
   undeclared, so installs could fail on first use.
 - The server reports **its own version** in the MCP handshake. It previously reported the
   version of `fastmcp`.
-- **22 error hints and docstring examples named tools that no longer existed** — an
-  earlier rename updated the code but not the strings. A tool's docstring *is* the
-  description a model reads, so these actively instructed it to call things that were not
-  there; the "too many results" recovery path, for one, offered five suggestions that all
-  named a removed tool.
+- **Error hints and docstring examples named tools that no longer existed** — an earlier
+  rename updated the code but not the strings. A tool's docstring *is* the description a
+  model reads, so these actively instructed it to call things that were not there; the
+  "too many results" recovery path, for one, offered five suggestions that all named a
+  removed tool. Every name the rename retired is now checked against the shipped strings,
+  so this class of drift cannot recur silently.
 
 ### Removed — X-Q (Exchange Queue)
 
@@ -110,6 +111,35 @@ eight flat "power queries" collapsed into modes of a single `task_query`.
 | `switch_instance` | `instance_switch` |
 | `get_active_context` | `ctx_get` |
 | `set_active_context` | `ctx_set` |
+| `add_to_calendar` | `cal_add_event` |
+| `analyze_project_dimensions` | `project_analyze` |
+| `batch_set_positions` | `batch_reorder_tasks` |
+| `bulk_create_labels` | `batch_create_labels` |
+| `bulk_relabel_tasks` | `batch_relabel` |
+| `bulk_set_task_positions` | `batch_reorder_tasks` |
+| `check_token_health` | `instance_check_health` |
+| `complete_tasks_by_label` | `batch_complete_by_label` |
+| `create_filtered_view` | `view_create` |
+| `delete_bucket` | `kanban_delete_bucket` |
+| `delete_view` | `view_delete` |
+| `export_all_projects` | `project_export` |
+| `get_context` | `ctx_get` |
+| `import_from_export` | `project_import` |
+| `list_all_projects` | `project_list_all` |
+| `list_all_tasks` | `search_all_tasks` |
+| `list_tasks_by_bucket` | `kanban_tasks_by_bucket` |
+| `move_task_to_project` | `task_move` |
+| `move_task_to_project_by_name` | `task_move` |
+| `move_tasks_by_label` | `batch_move_by_label` |
+| `move_tasks_by_label_to_buckets` | `batch_label_to_buckets` |
+| `set_reminders` | `task_set_reminders` |
+| `set_view_position` | `view_set_position` |
+| `setup_kanban_board` | `kanban_setup` |
+| `setup_project` | `project_setup` |
+| `sort_bucket` | `kanban_sort_bucket` |
+| `upcoming_deadlines` | `task_query(query='upcoming')` |
+| `update_project` | `project_update` |
+| `update_view` | `view_update` |
 
 `task_query` also gained `query='upcoming'` (with `days=N`).
 
