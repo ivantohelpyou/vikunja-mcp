@@ -70,6 +70,12 @@ If the ordering is wrong for you, retune the scoring weights at runtime — no c
 change, no redeploy. Overrides are per-user and every later deterministic run honors
 them.
 
+Two of them have a ceiling, and it is worth knowing before you tune. The overdue and
+deferral terms are per-unit and therefore **capped**, or a task four hundred days late
+would score four thousand and own your list forever. Past the cap, raising those weights
+changes nothing — at the default, anything more than a few days overdue is already
+pinned there. Lowering them still works. The other seven are unbounded.
+
 ---
 
 ## Tools
