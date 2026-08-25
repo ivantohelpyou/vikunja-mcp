@@ -1721,7 +1721,13 @@ def _create_project_impl_queue(title: str, description: str = "", hex_color: str
     user_id = f"vikunja:{requesting_user}"
 
     # Get bot username for sharing back
-    from .bot_provisioning import get_user_bot_credentials
+    try:
+        from .bot_provisioning import get_user_bot_credentials
+    except ImportError:
+        # Bot provisioning is server-side and unpublished. Fall back to the same direct
+        # path this function already takes when there is no requesting user (fa-sxac).
+        logger.warning("[create_project_queue] bot_provisioning unavailable — creating directly")
+        return _create_project_impl_direct(sanitized_title, description, hex_color, parent_project_id)
     bot_username = None
     bot_creds = get_user_bot_credentials(user_id)
     if bot_creds:
@@ -2781,8 +2787,11 @@ def _add_label_to_task_impl(task_id: int, label_id: int) -> dict:
         if _per_user_override() and _label_not_found_error(e):
             uid = _current_user_id.get() or ""
             if uid:
-                from . import label_cache
-                label_cache.forget(uid, _account_key(""))
+                try:
+                    from . import label_cache
+                    label_cache.forget(uid, _account_key(""))
+                except ImportError:
+                    pass  # server-side cache; absent in the extracted package (fa-sxac)
         raise
     # Invalidate caches since label may be "calendar"
     _invalidate_ics_cache(_get_current_instance())
@@ -3035,6 +3044,21 @@ def _reserved_label_conflict(title: str) -> Optional[str]:
     return RESERVED_LABEL_KEYWORDS.get((title or "").strip().lower())
 
 
+def _label_cache():
+    """The per-user label cache module, or None where it is not available.
+
+    The cache is server-side (a DB table keyed by user and account) and is not published,
+    so callers must be able to ask for it and carry on without it. Returning None rather
+    than raising lets the per-user branch be skipped as a whole — guarding only the
+    import would leave the four `label_cache.…` calls in that branch undefined (fa-sxac).
+    """
+    try:
+        from . import label_cache
+        return label_cache
+    except ImportError:
+        return None
+
+
 def _get_special_label_id(label_name: str, instance: str = None) -> int:
     """Get label ID for a special (system) label, creating if needed.
 
@@ -3061,11 +3085,12 @@ def _get_special_label_id(label_name: str, instance: str = None) -> int:
     # the shared config would poison every other user. So resolve straight against the
     # user's own Vikunja by name-scan/create (these API calls already ride the override
     # token) and DON'T touch the shared config cache.
-    if _per_user_override():
+    label_cache = _label_cache()
+    if _per_user_override() and label_cache is not None:
         # today/08 §5: the per-user cache lives in the DB, keyed (user, plain account
         # name) — the same key the read surfaces use — so a hit costs no API call and
-        # the shared config is never touched.
-        from . import label_cache
+        # the shared config is never touched. Absent the cache module we fall through to
+        # the shared-config path below, which is the correct answer, just slower.
         uid = _current_user_id.get() or ""
         key = _account_key(instance or "")
         if uid:
@@ -8038,8 +8063,16 @@ def _backend_key(instance: str = "", *, create: bool = True) -> str:
     Returns "" when the account resolves to no usable URL. Every caller treats that as
     "no chariot state available" and degrades, rather than filing rows under a key that
     means nothing.
+
+    The same "" is returned when the chariot store itself is absent. `fe_tasks` is
+    server-side and is not published, so in the extracted single-user package this
+    import fails — and "no chariot state available" is exactly the right answer there,
+    not an error to propagate up through today_actions (fa-sxac).
     """
-    from . import fe_tasks
+    try:
+        from . import fe_tasks
+    except ImportError:
+        return ""
     try:
         url, _token = _get_instance_config(_account_key(instance) or None)
     except Exception as e:  # noqa: BLE001
@@ -8085,8 +8118,18 @@ def _today_claimed_tasks(instance: str = "", now=None) -> list:
 def _today_apply_impl(task_id: int, instance: str = "", source: str = "kal") -> dict:
     """Swipe-right "do today": file a claim on the task for the actor's LOCAL today
     (today/08 D3). Idempotent — claiming twice is the success state. Writes raise
-    (an apply that did not persist must not report success). No Vikunja write."""
-    from . import today_claims
+    (an apply that did not persist must not report success). No Vikunja write.
+
+    The claim store is server-side and unpublished, so in the extracted single-user
+    package this returns an explicit error rather than an ImportError traceback. It must
+    NOT return a success shape — the docstring's rule holds precisely here: a claim that
+    could not be filed has not been filed (fa-sxac)."""
+    try:
+        from . import today_claims
+    except ImportError:
+        return {"error": "claiming_unavailable",
+                "message": "Claiming a task for today needs the server-side claim store, "
+                           "which this build does not include."}
     inst = _today_claim_inst(instance)
     day = _today_now(instance).date()
     today_claims.claim(_today_claim_actor(), _backend_key(instance), int(task_id), day, source=source)
@@ -8304,8 +8347,15 @@ def _today_reckoning_impl(instance: str = "", threshold: int = _RULE_OF_THREE) -
 def _today_reset_impl(instance: str = "") -> dict:
     """Manual "clear my today": withdraw every claim the actor filed for their LOCAL
     today on `instance`. There is no scheduled reset any more — yesterday's claims
-    stop matching on their own (today/08 §4.4). Returns {instance, cleared}."""
-    from . import today_claims
+    stop matching on their own (today/08 §4.4). Returns {instance, cleared}.
+
+    With no server-side claim store there is nothing to clear, and saying so beats an
+    ImportError. Reports zero rather than an error: clearing an empty set genuinely
+    succeeded (fa-sxac)."""
+    try:
+        from . import today_claims
+    except ImportError:
+        return {"instance": _today_claim_inst(instance), "cleared": 0}
     inst = _today_claim_inst(instance)
     day = _today_now(instance).date()
     try:
