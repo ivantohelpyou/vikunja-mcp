@@ -33,7 +33,7 @@ def _extract_defer_meta(description) -> dict:
 
 def _write_defer_meta(description, meta: dict) -> str:
     """Return ``description`` with its defer-meta marker replaced (or appended when
-    absent). SURGICAL: every other byte — visible content, smart-task frontmatter,
+    absent). SURGICAL: every other byte — visible content, other metadata,
     other markers — is left untouched, so two writers never clobber each other. A falsy ``meta`` removes
     the marker entirely."""
     description = description or ""

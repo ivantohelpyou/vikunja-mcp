@@ -1,4 +1,4 @@
-"""factumerit-mcp - MCP server for Vikunja task management."""
+"""vikunja-mcp - MCP server for Vikunja task management."""
 
 from .server import mcp
 

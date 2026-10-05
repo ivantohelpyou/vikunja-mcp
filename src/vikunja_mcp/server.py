@@ -236,7 +236,7 @@ _DEFER_REASONS = ("blocked", "too_big", "wrong_context", "not_mine", "dread")
 _DEFER_COUNTING_REASONS = frozenset({"dread"})  # the only reasons that bump defer_count
 _RULE_OF_THREE = 3        # on the 3rd `dread` defer, "Not today" → portfolio decision
 
-_N_PER_CLUSTER = 7  # per-cluster cap — the §5 guardrail against surfacing "everything"
+_N_PER_CLUSTER = 7  # per-cluster cap — a guardrail against surfacing "everything"
 
 _config_lock = threading.Lock()
 
@@ -6547,14 +6547,14 @@ def _task_door_closes(task: dict):
 
 
 def _is_today_candidate(task: dict, now, today_ids=()) -> bool:
-    """today-actions.md §1 inclusion predicate. A task is a candidate iff it is
+    """Inclusion predicate for today's candidates. A task is a candidate iff it is
     open AND matches >=1 signal: due by end of today, started by end of today,
-    priority >= 3, or is claimed for today. (Today-kanban-bucket inclusion
-    is deferred — bucket-title resolution lands with persistence in Phase 4.)
+    priority >= 3, or is claimed for today. (Today-kanban-bucket inclusion is
+    not implemented.)
 
     NOTE: not yet wired into the shipped pool — `_gather_today_candidates` builds
     the pool by unioning the focused-query primitives (which already cover overdue
-    / due-today / priority>=3 / unscheduled). Phase 4 uses THIS predicate to fold
+    / due-today / priority>=3 / unscheduled). This predicate is kept to fold
     in `today`-labeled tasks the primitives miss (e.g. a future-dated task the user
     explicitly swiped into today). Until then the `today_ids` path is unused.
     """
@@ -6579,7 +6579,7 @@ def _is_today_candidate(task: dict, now, today_ids=()) -> bool:
 def _score_today_candidate(task: dict, now, weights: dict) -> tuple:
     """Score one candidate and return ``(score:int, why:list[str])``.
 
-    Pure weighted sum of deterministic signals (today-actions.md §2). Every term
+    Pure weighted sum of deterministic signals. Every term
     that fires appends a short, human-readable trace to `why` — this is NOT an
     LLM explanation; it's what makes a swipe UI intelligible and a score auditable.
     A signal whose metadata is absent simply doesn't fire (costs a signal, never a
@@ -6753,12 +6753,11 @@ def _is_deferred(task: dict, now) -> bool:
 
 def _gather_today_candidates(instance: str = "", now=None, excluded=None) -> list:
     """Deduped candidate pool for today-actions, composed from the EXISTING
-    focused-query primitives rather than a from-scratch query path
-    (today-actions.md §4). Unions overdue / due-today / high-priority /
+    focused-query primitives rather than a from-scratch query path. Unions overdue / due-today / high-priority /
     unscheduled, dedupes by (instance, id), and attaches a deterministic
     ``score`` + ``why`` to each task (via the current weight set).
 
-    The four primitives ARE the §1 inclusion rules (overdue & due-today,
+    The four primitives ARE the inclusion rules (overdue & due-today,
     priority>=3, and unscheduled floaters that feed *Been waiting*); the enriched
     projection means each carries the start_date / updated / labels the scorer
     needs. Returns tasks sorted by score descending.
@@ -6809,7 +6808,7 @@ def _gather_today_candidates(instance: str = "", now=None, excluded=None) -> lis
 
 
 def _task_contexts(task: dict) -> list:
-    """The task's `@context` label titles (the `@*` namespace, label-metadata.md),
+    """The task's `@context` label titles (the `@*` namespace),
     in label order. These come from the LLM enrichment pass; never guessed."""
     return [str(l.get("title")) for l in (task.get("labels") or [])
             if str(l.get("title") or "").startswith("@")]
@@ -6824,8 +6823,7 @@ def _in_must_clear(task: dict, today_end) -> bool:
 
 
 def _cluster_candidates(candidates: list, now, project_names: dict = None, instance_urls: dict = None) -> list:
-    """Partition scored candidates into the 5 named-intent clusters
-    (today-actions.md §3). PURE — no fetches; `project_names` (id->title) and
+    """Partition scored candidates into the 5 named-intent clusters. PURE — no fetches; `project_names` (id->title) and
     `instance_urls` (instance-name->front-end base url, for cross-instance-safe
     deep-links) are supplied by the caller for display and default to empty.
 
@@ -6987,7 +6985,7 @@ def _instance_url_resolver():
 
 def _today_actions_impl(user_id: str = "", instance: str = "", now=None) -> dict:
     """Deterministic "what should I do today?" — scored, clustered candidate
-    actions (today-actions.md). PURE function of Vikunja state: no LLM, no side
+    actions. PURE function of Vikunja state: no LLM, no side
     effects. `now` is injectable for tests.
 
     `user_id` is accepted for API compatibility and currently unused; data is scoped

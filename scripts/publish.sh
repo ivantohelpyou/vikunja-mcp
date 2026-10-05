@@ -18,7 +18,7 @@ cd "$(dirname "$0")/.."
 check_private() {
     local file="$1" found=1
     # Case-sensitive: identifiers and acronyms.
-    if grep -nE "\bRBAC\b|\bECO\b|\bslash_|\bcredits\b|\boauth\b|\bgranter\b|\btier_|\b_get_user|\b_set_user|\bslack_|\b_for_slack\b" "$file"; then
+    if grep -nE "\bRBAC\b|\bECO\b|\bslash_|\bcredits\b|\bgranter\b|\btier_|\b_get_user|\b_set_user|\bslack_|\b_for_slack\b" "$file"; then
         found=0
     fi
     # Imports of modules that are not shipped in the package (private server modules).
@@ -26,14 +26,27 @@ check_private() {
         found=0
     fi
     # Case-insensitive: names and phrases.
-    if grep -niE "factumerit|factum erit commands|\beis bot\b|@eis\b|\bslack_|BOT_TOKEN|ADMIN_USER_IDS|DATABASE_URL|alembic" "$file"; then
+    if grep -niE "factumerit|factum erit|\beis bot\b|@eis\b|\bslack|mrkdwn|\boauth|BOT_TOKEN|ADMIN_USER_IDS|DATABASE_URL|alembic" "$file"; then
+        found=0
+    fi
+    # Tracker ids (bead prefixes of the private workspace) and references to unshipped spec docs.
+    if grep -nE "\b(fa|solutions|hq|sea|st|sw|purr|qrcards|smcp)-[a-z0-9]{3,5}(\.[0-9]+)*\b|§|\b[A-Za-z0-9_-]+\.md\b" "$file"; then
         found=0
     fi
     return $found
 }
 
+# Every Python file that ships in the wheel, not just server.py.
+shipped() { ls src/vikunja_mcp/*.py; }
+check_all() {
+    local f hit=1
+    for f in $(shipped); do check_private "$f" && hit=0; done
+    return $hit
+}
+
 if [[ "$1" == "--check-private" ]]; then
-    if check_private "${2:-src/vikunja_mcp/server.py}"; then
+    if [[ -n "${2:-}" ]]; then gate=(check_private "$2"); else gate=(check_all); fi
+    if "${gate[@]}"; then
         echo "FAIL: private code patterns found"
         exit 1
     fi
@@ -57,16 +70,16 @@ if [[ "$SKIP_TESTS" == "false" ]]; then
 
     if [[ -z "$VIKUNJA_URL" || -z "$VIKUNJA_TOKEN" ]]; then
         echo "   ⚠️  VIKUNJA_URL/TOKEN not set - running unit tests only"
-        uv run pytest tests/ -v -k "not TestVikunjaConnection"
+        uv run --extra dev pytest tests/ -v -k "not TestVikunjaConnection"
     else
         echo "   Running full test suite (including integration tests)"
-        uv run pytest tests/ -v
+        uv run --extra dev pytest tests/ -v
     fi
     echo ""
 fi
 
 echo "2. Checking for private code..."
-if check_private src/vikunja_mcp/server.py; then
+if check_all; then
     echo "❌ ERROR: Private code patterns found!"
     exit 1
 fi

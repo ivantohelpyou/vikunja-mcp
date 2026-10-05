@@ -56,7 +56,7 @@ instance health checks. **73 tools → 81.**
 
 The package is generated from a larger server, and some of that server's code had come
 along. None of it ran in a standalone install, but it was still shipped, and some of it
-named a hosted service. All of it is gone; `tools/list` is unchanged (81 tools).
+named a hosted service. All of it is gone. The same 81 tools with the same names and inputs; ten descriptions were reworded to describe standalone behaviour (`project_create` now says it creates the project directly).
 
 - **`https://vikunja.factumerit.app` as a fallback URL.** The server now takes its Vikunja
   from `VIKUNJA_URL` (and `VIKUNJA_TOKEN`) or from your instances config, and nothing else.
