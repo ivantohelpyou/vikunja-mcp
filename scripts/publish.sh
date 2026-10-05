@@ -12,6 +12,35 @@ set -e
 
 cd "$(dirname "$0")/.."
 
+# Check for private code patterns (hosted-server code that must not ship).
+# Word boundaries matter: a bare "ECO" matches _TTL_SECONDS.
+# Run just this gate against a file:  ./scripts/publish.sh --check-private [file]
+check_private() {
+    local file="$1" found=1
+    # Case-sensitive: identifiers and acronyms.
+    if grep -nE "\bRBAC\b|\bECO\b|\bslash_|\bcredits\b|\boauth\b|\bgranter\b|\btier_|\b_get_user|\b_set_user|\bslack_|\b_for_slack\b" "$file"; then
+        found=0
+    fi
+    # Imports of modules that are not shipped in the package (private server modules).
+    if grep -nE "^[[:space:]]*(from[[:space:]]+\.?(vikunja_mcp\.)?(token_broker|bot_provisioning|bot_jwt_manager|project_cloner|today_claims|deferrals|occasions|fe_tasks|routines|user_settings|vikunja_client|handoffs|label_cache)\b|from[[:space:]]+\.[[:space:]]+import[[:space:]]+.*\b(token_broker|bot_provisioning|bot_jwt_manager|project_cloner|today_claims|deferrals|occasions|fe_tasks|routines|user_settings|vikunja_client|handoffs|label_cache)\b|import[[:space:]]+(token_broker|bot_provisioning|bot_jwt_manager|project_cloner|today_claims|deferrals|occasions|fe_tasks|routines|user_settings|vikunja_client|handoffs|label_cache)\b)" "$file"; then
+        found=0
+    fi
+    # Case-insensitive: names and phrases.
+    if grep -niE "factumerit|factum erit commands|\beis bot\b|@eis\b|\bslack_|BOT_TOKEN|ADMIN_USER_IDS|DATABASE_URL|alembic" "$file"; then
+        found=0
+    fi
+    return $found
+}
+
+if [[ "$1" == "--check-private" ]]; then
+    if check_private "${2:-src/vikunja_mcp/server.py}"; then
+        echo "FAIL: private code patterns found"
+        exit 1
+    fi
+    echo "PASS: no private patterns found"
+    exit 0
+fi
+
 echo "=== vikunja-mcp publish script ==="
 echo ""
 
@@ -36,9 +65,8 @@ if [[ "$SKIP_TESTS" == "false" ]]; then
     echo ""
 fi
 
-# Check for private code patterns
 echo "2. Checking for private code..."
-if grep -rE "RBAC|ECO|slash_|credits|oauth|granter|tier_|_get_user|_set_user" src/vikunja_mcp/server.py; then
+if check_private src/vikunja_mcp/server.py; then
     echo "❌ ERROR: Private code patterns found!"
     exit 1
 fi
