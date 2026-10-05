@@ -1,21 +1,67 @@
 """
 Tests for vikunja-mcp server.
 
-Run with:
-    cd ~/vikunja-mcp
-    uv run pytest tests/ -v
+Run the unit tests (no network, no Vikunja needed):
 
-For integration tests (against real Vikunja), set:
+    uv run --extra dev pytest -q -k "not TestVikunjaConnection"
+
+For the integration tests (against a real Vikunja), set:
+
     VIKUNJA_URL=https://your-instance.com
     VIKUNJA_TOKEN=your-token
+
+and run `uv run --extra dev pytest -q`. The integration tests are read-only.
 """
 
+import asyncio
+import json
 import os
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 # ============================================================================
-# FIXTURES
+# HELPERS AND FIXTURES
 # ============================================================================
+
+
+def list_tool_names() -> list:
+    """The tool names a real MCP client sees from tools/list (in-memory transport)."""
+    from fastmcp import Client
+    from vikunja_mcp.server import mcp
+
+    async def _list():
+        async with Client(mcp) as client:
+            return [t.name for t in await client.list_tools()]
+
+    return asyncio.run(_list())
+
+
+class FakeResponse:
+    """The slice of requests.Response that server._request touches."""
+
+    def __init__(self, payload, status_code=200):
+        self.payload = payload
+        self.status_code = status_code
+        self.text = json.dumps(payload)
+        self.headers = {}
+
+    def json(self):
+        return self.payload
+
+
+@pytest.fixture
+def isolated_config(tmp_path, monkeypatch):
+    """Point the server at an empty config dir and no Vikunja env, so nothing on the
+    developer's machine (~/.vikunja-mcp, VIKUNJA_*) leaks into a test."""
+    from vikunja_mcp import server
+
+    monkeypatch.setattr(server, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(server, "CONFIG_FILE", tmp_path / "config.yaml")
+    for var in ("VIKUNJA_URL", "VIKUNJA_TOKEN", "VIKUNJA_BOT_TOKEN", "VIKUNJA_INSTANCES"):
+        monkeypatch.delenv(var, raising=False)
+    return tmp_path
+
 
 @pytest.fixture
 def vikunja_configured():
@@ -31,200 +77,489 @@ def vikunja_configured():
 # UNIT TESTS (no network required)
 # ============================================================================
 
+
 class TestServerImport:
-    """Test that the server module can be imported."""
+    """The package imports and identifies itself."""
+
+    def test_import_package(self):
+        import vikunja_mcp
+
+        assert vikunja_mcp is not None
 
     def test_import_server(self):
-        """Server module should import without errors."""
         from vikunja_mcp import server
-        assert server is not None
 
-    def test_import_mcp(self):
-        """MCP instance should be importable."""
-        from vikunja_mcp.server import mcp
-        assert mcp is not None
+        assert callable(server.main)
 
-    def test_mcp_has_tools(self):
-        """MCP should have tools registered."""
+    def test_server_identity(self):
+        """A client's initialize handshake reports name 'vikunja' and the wheel's version."""
+        from fastmcp import Client
         from vikunja_mcp.server import mcp
-        tools = mcp._tool_manager._tools
-        assert len(tools) > 0
+
+        async def _init():
+            async with Client(mcp) as client:
+                return client.initialize_result.serverInfo
+
+        info = asyncio.run(_init())
+        assert info.name == "vikunja"
+        assert info.version not in ("", "unknown", None)
 
 
 class TestToolsRegistered:
-    """Test that all expected tools are registered."""
+    """tools/list is the public surface: 81 tools, with these names."""
 
-    EXPECTED_TOOLS = [
-        # Projects
-        "list_projects",
-        "get_project",
-        "create_project",
-        "update_project",
-        "delete_project",
-        # Tasks
-        "list_tasks",
-        "get_task",
-        "create_task",
-        "update_task",
-        "complete_task",
-        "delete_task",
-        # Labels
-        "list_labels",
-        "create_label",
-        "delete_label",
-        "add_label_to_task",
-        # Kanban
-        "list_buckets",
-        "create_bucket",
-        # Relations
-        "create_task_relation",
-        "list_task_relations",
-    ]
-
-    def test_all_tools_registered(self):
-        """All expected tools should be registered."""
-        from vikunja_mcp.server import mcp
-
-        tool_names = [t.name for t in mcp._tool_manager._tools.values()]
-
-        for expected in self.EXPECTED_TOOLS:
-            assert expected in tool_names, f"Missing tool: {expected}"
-
-    def test_no_private_tools(self):
-        """No private/internal tools should be exposed."""
-        from vikunja_mcp.server import mcp
-
-        tool_names = [t.name for t in mcp._tool_manager._tools.values()]
-
-        private_patterns = [
-            "slash_",  # Slack commands
-            "oauth_",  # OAuth handlers
-            "_user_",  # User management
-            "credits",  # Billing
-            "ECO",     # Slack gamification
-        ]
-
-        for tool in tool_names:
-            for pattern in private_patterns:
-                assert pattern not in tool, f"Private tool exposed: {tool}"
+    # The 0.10.0 surface, grouped by prefix.
+    EXPECTED_TOOLS = {
+        "project": ["project_list", "project_list_all", "project_get", "project_create",
+                    "project_update", "project_delete", "project_analyze", "project_setup",
+                    "project_export", "project_import", "project_create_from_template"],
+        "task": ["task_list", "task_get", "task_create", "task_update", "task_complete",
+                 "task_delete", "task_move", "task_query", "task_add_label",
+                 "task_assign_user", "task_unassign_user", "task_set_position",
+                 "task_set_reminders", "task_create_relation", "task_list_relations"],
+        "label": ["label_list", "label_create", "label_delete"],
+        "kanban": ["kanban_get", "kanban_list_buckets", "kanban_create_bucket",
+                   "kanban_delete_bucket", "kanban_setup", "kanban_sort_bucket",
+                   "kanban_tasks_by_bucket"],
+        "view": ["view_list", "view_create", "view_update", "view_delete",
+                 "view_get_tasks", "view_set_position"],
+        "batch": ["batch_create_tasks", "batch_update_tasks", "batch_create_labels",
+                  "batch_relabel", "batch_assign_buckets", "batch_label_to_buckets",
+                  "batch_move_by_label", "batch_complete_by_label", "batch_reorder_tasks"],
+        "comment": ["comment_add", "comment_list", "comment_update", "comment_delete",
+                    "comment_recent"],
+        "instance": ["instance_list", "instance_connect", "instance_disconnect",
+                     "instance_rename", "instance_switch", "instance_check_health"],
+        "ctx_config": ["ctx_get", "ctx_set", "config_get", "config_set", "config_list",
+                       "config_update", "config_delete"],
+        "today_triage": ["today_actions", "today_snooze", "today_reckoning",
+                         "today_get_weights", "today_set_weights", "triage_park",
+                         "triage_parked", "assign_queue", "assign_apply"],
+        "search_cal": ["search_all", "search_all_tasks", "cal_add_event"],
+    }
 
     def test_tool_count(self):
-        """Should have exactly 19 tools."""
+        assert len(list_tool_names()) == 81
+
+    def test_all_expected_tools_registered(self):
+        names = set(list_tool_names())
+        expected = {n for group in self.EXPECTED_TOOLS.values() for n in group}
+        assert expected <= names, f"missing: {sorted(expected - names)}"
+        # The expected list is the whole surface, not a sample.
+        assert names == expected, f"unlisted tools: {sorted(names - expected)}"
+
+    def test_tool_names_are_unique(self):
+        names = list_tool_names()
+        assert len(names) == len(set(names))
+
+    def test_old_pre_0_10_names_are_gone(self):
+        names = set(list_tool_names())
+        for old in ("list_projects", "get_project", "create_project", "list_tasks",
+                    "create_task", "complete_task", "list_labels", "add_label_to_task"):
+            assert old not in names
+
+    def test_every_tool_has_a_description_and_schema(self):
+        from fastmcp import Client
         from vikunja_mcp.server import mcp
 
-        tools = mcp._tool_manager._tools
-        assert len(tools) == 19, f"Expected 19 tools, got {len(tools)}"
+        async def _tools():
+            async with Client(mcp) as client:
+                return await client.list_tools()
+
+        for tool in asyncio.run(_tools()):
+            assert tool.description and tool.description.strip(), tool.name
+            assert tool.inputSchema.get("type") == "object", tool.name
 
 
-class TestHelperFunctions:
-    """Test helper functions."""
+class TestFormatters:
+    """The formatter helpers return plain dicts with a stable shape."""
 
-    def test_format_task(self):
-        """_format_task should format a task dict."""
+    def test_format_task_shape(self):
         from vikunja_mcp.server import _format_task
 
-        task = {
-            "id": 123,
-            "title": "Test Task",
-            "done": False,
-            "priority": 3,
-        }
+        result = _format_task({"id": 123, "title": "Test Task", "done": False, "priority": 3})
+        assert isinstance(result, dict)
+        assert result["id"] == 123
+        assert result["title"] == "Test Task"
+        assert result["done"] is False
+        assert result["priority"] == 3
+        # Defaults for everything the API did not send.
+        assert result["description"] == ""
+        assert result["labels"] == []
+        assert result["assignees"] == []
+        assert result["reminders"] == []
+        assert result["bucket_id"] == 0
+        assert result["repeat_after"] == 0
 
-        result = _format_task(task)
-        assert "Test Task" in result
-        assert "123" in result
-        assert "High" in result  # priority 3 = High
-
-    def test_format_task_completed(self):
-        """_format_task should show checkmark for done tasks."""
+    def test_format_task_done_flag(self):
         from vikunja_mcp.server import _format_task
 
-        task = {"id": 1, "title": "Done Task", "done": True}
-        result = _format_task(task)
-        assert "✓" in result
+        assert _format_task({"id": 1, "title": "Done Task", "done": True})["done"] is True
 
-    def test_format_project(self):
-        """_format_project should format a project dict."""
+    def test_format_task_flattens_labels_assignees_reminders(self):
+        from vikunja_mcp.server import _format_task
+
+        result = _format_task({
+            "id": 5, "title": "t", "project_id": 9,
+            "labels": [{"id": 1, "title": "home", "hex_color": "ff0000"}],
+            "assignees": [{"id": 2, "username": "ivan", "email": "x@example.com"}],
+            "reminders": [{"reminder": "2026-01-01T09:00:00Z", "relative_period": 0}],
+        })
+        assert result["project_id"] == 9
+        assert result["labels"] == [{"id": 1, "title": "home"}]
+        assert result["assignees"] == [{"id": 2, "username": "ivan"}]
+        assert result["reminders"] == ["2026-01-01T09:00:00Z"]
+
+    def test_format_task_requires_id_and_title(self):
+        from vikunja_mcp.server import _format_task
+
+        with pytest.raises(KeyError):
+            _format_task({"title": "no id"})
+
+    def test_format_project_shape(self):
         from vikunja_mcp.server import _format_project
 
-        project = {"id": 456, "title": "Test Project"}
-        result = _format_project(project)
-        assert "Test Project" in result
-        assert "456" in result
+        result = _format_project({"id": 456, "title": "Test Project"})
+        assert result == {
+            "id": 456,
+            "title": "Test Project",
+            "description": "",
+            "parent_project_id": 0,
+            "hex_color": "",
+            "is_favorite": False,
+            "is_archived": False,
+            "position": 0,
+        }
+
+    def test_format_project_keeps_given_values(self):
+        from vikunja_mcp.server import _format_project
+
+        result = _format_project({"id": 1, "title": "P", "parent_project_id": 7,
+                                  "is_archived": True, "hex_color": "3498db"})
+        assert result["parent_project_id"] == 7
+        assert result["is_archived"] is True
+        assert result["hex_color"] == "3498db"
+
+    def test_format_label_shape(self):
+        from vikunja_mcp.server import _format_label
+
+        assert _format_label({"id": 3, "title": "urgent", "extra": "dropped"}) == {
+            "id": 3, "title": "urgent", "hex_color": ""}
+
+    def test_format_comment_shape(self):
+        from vikunja_mcp.server import _format_comment
+
+        result = _format_comment({"id": 8, "comment": "<p>hi</p>", "task_id": 4,
+                                  "author": {"id": 2, "username": "ivan", "name": "Ivan"}})
+        assert result["id"] == 8
+        assert result["comment"] == "<p>hi</p>"
+        assert result["author_username"] == "ivan"
+        assert result["task_id"] == 4
+
+
+class TestTextHelpers:
+    def test_sanitize_title_strips_html(self):
+        from vikunja_mcp.server import _sanitize_title
+
+        assert "<" not in _sanitize_title("<b>Bold Title</b>")
+        assert "Bold Title" in _sanitize_title("<b>Bold Title</b>")
+        assert "script" not in _sanitize_title("<script>alert(1)</script>Test").lower()
+
+    def test_md_to_html_converts_markdown(self):
+        from vikunja_mcp.server import md_to_html
+
+        assert md_to_html("**bold**") == "<p><strong>bold</strong></p>"
+
+    def test_md_to_html_passes_html_through(self):
+        from vikunja_mcp.server import md_to_html
+
+        assert md_to_html("<p>already</p>") == "<p>already</p>"
+
+
+class TestDeferLogic:
+    """The deferral marker lives in the task description and survives round-trips."""
+
+    def test_write_then_extract_roundtrip(self):
+        from vikunja_mcp.defer_logic import _extract_defer_meta, _write_defer_meta
+
+        state = {"defer_count": 2, "defer_reason": "dread", "deferred_until": "2026-07-20"}
+        desc = _write_defer_meta("<p>Body</p>", state)
+        assert desc.startswith("<p>Body</p>")
+        assert _extract_defer_meta(desc) == state
+
+    def test_clearing_marker_leaves_body(self):
+        from vikunja_mcp.defer_logic import _extract_defer_meta, _write_defer_meta
+
+        desc = _write_defer_meta("<p>Body</p>", {"defer_count": 1})
+        cleared = _write_defer_meta(desc, {})
+        assert cleared == "<p>Body</p>"
+        assert _extract_defer_meta(cleared) == {}
+
+    def test_malformed_marker_is_empty(self):
+        from vikunja_mcp.defer_logic import _extract_defer_meta
+
+        assert _extract_defer_meta("<!-- defer-meta: {not json} -->") == {}
+        assert _extract_defer_meta(None) == {}
+
+    def test_defer_count_ignores_bools_and_negatives(self):
+        from vikunja_mcp.defer_logic import _defer_count
+
+        assert _defer_count({"defer": {"defer_count": 3}}) == 3
+        assert _defer_count({"defer": {"defer_count": True}}) == 0
+        assert _defer_count({"defer": {"defer_count": -2}}) == 0
+        assert _defer_count({"description": ""}) == 0
+
+
+class TestTodayEngine:
+    """The today_* scoring and clustering engine is pure; check what it decides."""
+
+    NOW = datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc)
+
+    def _score(self, task):
+        from vikunja_mcp.server import _TODAY_DEFAULT_WEIGHTS, _score_today_candidate
+
+        return _score_today_candidate(task, self.NOW, dict(_TODAY_DEFAULT_WEIGHTS))
+
+    def test_overdue_task_outscores_unscheduled(self):
+        overdue = {"id": 1, "due_date": (self.NOW - timedelta(days=3)).isoformat()}
+        floater = {"id": 2}
+        s_over, why_over = self._score(overdue)
+        s_floater, _ = self._score(floater)
+        assert s_over > s_floater
+        assert "3d overdue" in why_over
+
+    def test_why_trace_is_a_list_of_strings(self):
+        _, why = self._score({"id": 1, "due_date": (self.NOW - timedelta(days=1)).isoformat()})
+        assert why and all(isinstance(w, str) for w in why)
+
+    def test_task_kind(self):
+        from vikunja_mcp.server import _task_kind
+
+        assert _task_kind({"id": 1}) == "deed"
+        assert _task_kind({"id": 1, "end_date": "2026-07-16T10:00:00Z"}) == "event"
+        assert _task_kind({"id": 1, "end_date": "0001-01-01T00:00:00Z"}) == "deed"
+        assert _task_kind({"id": 1, "labels": [{"title": "anno"}]}) == "occasion"
+
+    def test_parse_vikunja_dt_zero_sentinel_is_none(self):
+        from vikunja_mcp.server import _parse_vikunja_dt
+
+        assert _parse_vikunja_dt("0001-01-01T00:00:00Z") is None
+        assert _parse_vikunja_dt("") is None
+        assert _parse_vikunja_dt("garbage") is None
+        parsed = _parse_vikunja_dt("2026-07-15T10:00:00Z")
+        assert parsed == self.NOW
+
+    def test_snoozed_means_future_start_date(self):
+        from vikunja_mcp.server import _is_snoozed
+
+        assert _is_snoozed({"start_date": (self.NOW + timedelta(days=2)).isoformat()}, self.NOW)
+        assert not _is_snoozed({"start_date": (self.NOW - timedelta(days=2)).isoformat()}, self.NOW)
+        assert not _is_snoozed({}, self.NOW)
+
+    def test_deferred_means_future_deferred_until(self):
+        from vikunja_mcp.defer_logic import _write_defer_meta
+        from vikunja_mcp.server import _is_deferred
+
+        later = _write_defer_meta("", {"deferred_until": "2026-07-20"})
+        past = _write_defer_meta("", {"deferred_until": "2026-07-01"})
+        assert _is_deferred({"description": later}, self.NOW)
+        assert not _is_deferred({"description": past}, self.NOW)
+
+    def test_clusters_put_due_today_in_must_clear(self):
+        from vikunja_mcp.server import _cluster_candidates
+
+        task = {"id": 11, "title": "Pay rent", "instance": "default", "project_id": 1,
+                "due_date": self.NOW.isoformat(), "score": 40, "why": ["due today"]}
+        clusters = _cluster_candidates([task], self.NOW, {("default", 1): "Home"}, {})
+        assert [c["intent"] for c in clusters] == ["must_clear"]
+        item = clusters[0]["items"][0]
+        assert item["task_id"] == "11"
+        assert item["title"] == "Pay rent"
+        assert item["project"] == "Home"
+        assert item["kind"] == "deed"
+        assert item["defer_count"] == 0
+
+    def test_empty_candidates_make_no_clusters(self):
+        from vikunja_mcp.server import _cluster_candidates
+
+        assert _cluster_candidates([], self.NOW) == []
+
+    def test_today_apply_is_honest_when_there_is_no_claim_store(self):
+        from vikunja_mcp.server import _today_apply_impl
+
+        assert _today_apply_impl(1)["error"] == "claiming_unavailable"
+
+    def test_weights_default_and_reject_unknown(self, isolated_config):
+        from vikunja_mcp.server import (_TODAY_DEFAULT_WEIGHTS, _set_today_action_weights,
+                                        _today_action_weights)
+
+        assert _today_action_weights() == _TODAY_DEFAULT_WEIGHTS
+        result = _set_today_action_weights({"W_GOAL": 20, "W_BOGUS": 1, "W_QUICK": "x"})
+        assert result["set"] == {"W_GOAL": 20}
+        assert sorted(result["rejected"]) == ["W_BOGUS", "W_QUICK"]
+        assert _today_action_weights()["W_GOAL"] == 20
+        # Persisted to the (temporary) config file only.
+        assert (isolated_config / "config.yaml").exists()
+
+    def test_all_rejected_weights_write_nothing(self, isolated_config):
+        from vikunja_mcp.server import _set_today_action_weights
+
+        result = _set_today_action_weights({"W_BOGUS": 1})
+        assert result["set"] == {}
+        assert not (isolated_config / "config.yaml").exists()
+
+    def test_park_roundtrip_uses_config_file(self, isolated_config):
+        from vikunja_mcp.server import _triage_parked, _triage_set_parked
+
+        assert _triage_parked() == set()
+        assert _triage_set_parked(42, "work", True)["parked"] is True
+        assert _triage_parked() == {"work:42"}
+        _triage_set_parked(42, "work", False)
+        assert _triage_parked() == set()
+
+
+class TestStandaloneConfig:
+    """The standalone server takes its Vikunja from VIKUNJA_URL / VIKUNJA_TOKEN only."""
+
+    def test_no_url_means_error_not_a_hosted_default(self, isolated_config):
+        from vikunja_mcp.server import _get_instance_config
+
+        with pytest.raises(ValueError):
+            _get_instance_config()
+
+    def test_url_and_token_come_from_env(self, isolated_config, monkeypatch):
+        from vikunja_mcp.server import _get_instance_config
+
+        monkeypatch.setenv("VIKUNJA_URL", "http://localhost:3456/")
+        monkeypatch.setenv("VIKUNJA_TOKEN", "tk_test")
+        assert _get_instance_config() == ("http://localhost:3456", "tk_test")
+
+    def test_bot_token_env_is_not_read(self, isolated_config, monkeypatch):
+        from vikunja_mcp.server import _get_instance_config
+
+        monkeypatch.setenv("VIKUNJA_URL", "http://localhost:3456")
+        monkeypatch.setenv("VIKUNJA_BOT_TOKEN", "tk_bot")
+        assert _get_instance_config() == ("http://localhost:3456", "")
+
+    def test_instances_come_from_config_dir(self, isolated_config):
+        import yaml
+        from vikunja_mcp.server import _get_instances
+
+        (isolated_config / "config.yaml").write_text(yaml.safe_dump({
+            "instances": {"work": {"url": "https://work.example.com", "token": "tk_w"}}}))
+        assert _get_instances()["work"]["url"] == "https://work.example.com"
+
+    def test_request_hits_only_the_configured_url(self, isolated_config, monkeypatch):
+        from vikunja_mcp import server
+
+        monkeypatch.setenv("VIKUNJA_URL", "http://localhost:3456")
+        monkeypatch.setenv("VIKUNJA_TOKEN", "tk_test")
+        seen = {}
+
+        def fake_request(method, url, headers=None, **kwargs):
+            seen.update(method=method, url=url, auth=headers["Authorization"])
+            return FakeResponse([{"id": 1, "title": "P"}])
+
+        monkeypatch.setattr(server.requests, "request", fake_request)
+        result = server._request("GET", "/api/v1/projects", allow_instance_fallback=True)
+        assert result == [{"id": 1, "title": "P"}]
+        assert seen == {"method": "GET", "url": "http://localhost:3456/api/v1/projects",
+                        "auth": "Bearer tk_test"}
+
+    def test_request_without_fallback_is_refused(self, isolated_config, monkeypatch):
+        from vikunja_mcp import server
+
+        monkeypatch.setenv("VIKUNJA_URL", "http://localhost:3456")
+        monkeypatch.setenv("VIKUNJA_TOKEN", "tk_test")
+        monkeypatch.setattr(server.requests, "request",
+                            lambda *a, **k: pytest.fail("must not reach the network"))
+        with pytest.raises(ValueError):
+            server._request("GET", "/api/v1/projects")
+
+    def test_api_errors_become_value_errors(self, isolated_config, monkeypatch):
+        from vikunja_mcp import server
+
+        monkeypatch.setenv("VIKUNJA_URL", "http://localhost:3456")
+        monkeypatch.setenv("VIKUNJA_TOKEN", "tk_test")
+        monkeypatch.setattr(server.requests, "request",
+                            lambda *a, **k: FakeResponse({"message": "nope"}, 404))
+        with pytest.raises(ValueError, match="not found"):
+            server._request("GET", "/api/v1/projects/9", allow_instance_fallback=True)
+
+
+class TestToolCallsThroughMCP:
+    """Call tools the way a client does, with only the HTTP layer faked."""
+
+    def _call(self, name, args, monkeypatch, payload):
+        from fastmcp import Client
+        from vikunja_mcp import server
+
+        monkeypatch.setenv("VIKUNJA_URL", "http://localhost:3456")
+        monkeypatch.setenv("VIKUNJA_TOKEN", "tk_test")
+        monkeypatch.setattr(server.requests, "request",
+                            lambda *a, **k: FakeResponse(payload))
+
+        async def _go():
+            async with Client(server.mcp) as client:
+                return await client.call_tool(name, args)
+
+        return asyncio.run(_go())
+
+    def test_project_list_returns_formatted_projects(self, isolated_config, monkeypatch):
+        result = self._call("project_list", {}, monkeypatch,
+                            [{"id": 3, "title": "Kitchen", "extra": "dropped"}])
+        text = "".join(block.text for block in result.content)
+        assert "Kitchen" in text
+        assert "dropped" not in text
 
 
 # ============================================================================
-# INTEGRATION TESTS (require real Vikunja instance)
+# INTEGRATION TESTS (require a real Vikunja instance; read-only)
 # ============================================================================
+
 
 class TestVikunjaConnection:
-    """Integration tests against real Vikunja instance."""
+    """Integration tests against a real Vikunja instance."""
 
-    def test_connection(self, vikunja_configured):
-        """Should connect to Vikunja API."""
-        from vikunja_mcp.server import _vikunja_request
+    def test_projects(self, vikunja_configured):
+        from vikunja_mcp.server import _request
 
-        projects = _vikunja_request("GET", "/projects")
+        projects = _request("GET", "/api/v1/projects", allow_instance_fallback=True)
         assert isinstance(projects, list)
-
-    def test_list_projects(self, vikunja_configured):
-        """Should list projects."""
-        from vikunja_mcp.server import _vikunja_request
-
-        projects = _vikunja_request("GET", "/projects")
-        assert len(projects) >= 0
-
         if projects:
             assert "id" in projects[0]
             assert "title" in projects[0]
 
-    def test_list_labels(self, vikunja_configured):
-        """Should list labels."""
-        from vikunja_mcp.server import _vikunja_request
+    def test_labels(self, vikunja_configured):
+        from vikunja_mcp.server import _request
 
-        labels = _vikunja_request("GET", "/labels")
-        assert isinstance(labels, list)
+        assert isinstance(_request("GET", "/api/v1/labels", allow_instance_fallback=True), list)
 
-    def test_get_project(self, vikunja_configured):
-        """Should get a specific project."""
-        from vikunja_mcp.server import _vikunja_request
+    def test_get_project_and_its_tasks(self, vikunja_configured):
+        from vikunja_mcp.server import _request
 
-        projects = _vikunja_request("GET", "/projects")
+        projects = _request("GET", "/api/v1/projects", allow_instance_fallback=True)
         if not projects:
             pytest.skip("No projects to test")
-
-        project = _vikunja_request("GET", f"/projects/{projects[0]['id']}")
-        assert project["id"] == projects[0]["id"]
-
-    def test_list_tasks_from_project(self, vikunja_configured):
-        """Should list tasks from a project."""
-        from vikunja_mcp.server import _vikunja_request
-
-        projects = _vikunja_request("GET", "/projects")
-        if not projects:
-            pytest.skip("No projects to test")
-
-        tasks = _vikunja_request("GET", f"/projects/{projects[0]['id']}/tasks")
-        assert isinstance(tasks, list)
+        pid = projects[0]["id"]
+        assert _request("GET", f"/api/v1/projects/{pid}",
+                        allow_instance_fallback=True)["id"] == pid
+        assert isinstance(_request("GET", f"/api/v1/projects/{pid}/tasks",
+                                   allow_instance_fallback=True), list)
 
 
 # ============================================================================
 # SMOKE TEST (quick validation before publish)
 # ============================================================================
 
+
 class TestSmokeTest:
     """Quick smoke test to validate before publishing."""
 
     def test_smoke(self):
-        """Basic smoke test - import, check tools, no crashes."""
-        from vikunja_mcp.server import mcp, _format_task, _format_project
+        """Import the package, list tools, run both formatters."""
+        from vikunja_mcp.server import _format_project, _format_task
 
-        # Tools registered
-        tools = mcp._tool_manager._tools
-        assert len(tools) == 19
-
-        # Formatters work
-        assert "Test" in _format_task({"id": 1, "title": "Test"})
-        assert "Test" in _format_project({"id": 1, "title": "Test"})
-
-        print("✅ Smoke test passed")
+        assert len(list_tool_names()) == 81
+        assert _format_task({"id": 1, "title": "Test"})["title"] == "Test"
+        assert _format_project({"id": 1, "title": "Test"})["title"] == "Test"
