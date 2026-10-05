@@ -19,7 +19,7 @@ the same ranking every time.
 | `today_actions` | Scored, clustered candidates under named intents, each carrying a `why` trace |
 | `today_snooze` | Reason-aware deferral. A reason is required; deferred tasks escalate on return |
 | `today_reckoning` | Only tasks deferred 3+ times — the chronic avoiders. Exists to kill things |
-| `today_set_weights` / `today_get_weights` | Retune the ranking at runtime, per user, no code change |
+| `today_set_weights` / `today_get_weights` | Retune the ranking at runtime, no code change |
 | `triage_park` / `triage_parked` | Sweep a speculative project tree aside, reversibly |
 
 `today_apply` and `today_reset` are **not** included: the claim store they write to is
@@ -51,6 +51,25 @@ instance health checks. **73 tools → 81.**
   "too many results" recovery path, for one, offered five suggestions that all named a
   removed tool. Every name the rename retired is now checked against the shipped strings,
   so this class of drift cannot recur silently.
+
+### Removed — leftovers from the hosted server
+
+The package is generated from a larger server, and some of that server's code had come
+along. None of it ran in a standalone install, but it was still shipped, and some of it
+named a hosted service. All of it is gone; `tools/list` is unchanged (81 tools).
+
+- **`https://vikunja.factumerit.app` as a fallback URL.** The server now takes its Vikunja
+  from `VIKUNJA_URL` (and `VIKUNJA_TOKEN`) or from your instances config, and nothing else.
+  `VIKUNJA_BOT_TOKEN` is no longer read.
+- Bot mode (`@eis`), the Slack formatters and help text, the HMAC `/move/...` route, and
+  the per-user and calendar-request override machinery that nothing in this package set.
+- Guarded imports of eleven server-side modules (token broker, bot provisioning, claim,
+  deferral, occasion, handoff, routine and settings stores) and the branches behind them.
+  Where one of those stores was the only home for some state, the package now uses what it
+  always fell back to: the task description marker for deferrals, and `config.yaml` for
+  weights and parked projects.
+- Internal tracker ids and review references in comments and docstrings.
+- `scripts/publish.sh` checks for all of the above before it will build.
 
 ### Removed — X-Q (Exchange Queue)
 

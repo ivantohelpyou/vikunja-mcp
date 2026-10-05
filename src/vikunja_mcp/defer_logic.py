@@ -1,27 +1,24 @@
-"""Pure deferral-state logic (spec 07 / fa-fhtl), extracted from ``server.py`` so it can
-be mutation-tested in isolation.
+"""Pure deferral-state logic, kept separate from ``server.py`` so it can
+be tested in isolation.
 
 No I/O, no Vikunja calls — string/dict in, string/dict out. The storage is a
 ``<!-- defer-meta: {...} -->`` marker embedded in a task description (it survives task
-completion, which the eval-corpus requirement demands); this module reads and writes
-that marker **surgically**, leaving every other byte — visible content, the smart-task
-``eis-meta`` marker — untouched, so the notification poller and the defer writer never
-clobber each other.
+completion); this module reads and writes
+that marker **surgically**, leaving every other byte — visible content and any
+other marker — untouched, so two writers never clobber each other.
 """
 import json
 import re
 
-# The description-embedded marker holding a task's deferral state. Independent of the
-# smart-task eis-meta marker — a task may carry both; this pattern only matches its own.
+# The description-embedded marker holding a task's deferral state. A task may carry
+# other markers too; this pattern only matches its own.
 _DEFER_META_PATTERN = re.compile(r"<!--\s*defer-meta:\s*(\{.*?\})\s*-->", re.DOTALL)
 
 
-# @PUBLIC_HELPER
 def _extract_defer_meta(description) -> dict:
     """Parse the deferral-state blob from a task description's
-    ``<!-- defer-meta: {...} -->`` marker (fa-fhtl / spec 07), or {} if absent or
-    malformed. Independent of the smart-task eis-meta machinery — a task may carry
-    both markers; this reader only ever matches its own. Never raises."""
+    ``<!-- defer-meta: {...} -->`` marker, or {} if absent or
+    malformed. A task may carry other markers; this reader only ever matches its own. Never raises."""
     if not description:
         return {}
     m = _DEFER_META_PATTERN.search(description)
@@ -34,12 +31,10 @@ def _extract_defer_meta(description) -> dict:
     return val if isinstance(val, dict) else {}
 
 
-# @PUBLIC_HELPER
 def _write_defer_meta(description, meta: dict) -> str:
     """Return ``description`` with its defer-meta marker replaced (or appended when
     absent). SURGICAL: every other byte — visible content, smart-task frontmatter,
-    eis-meta — is left untouched, so the notification poller and the defer writer
-    never clobber each other (spec 07 storage hazard #1). A falsy ``meta`` removes
+    other markers — is left untouched, so two writers never clobber each other. A falsy ``meta`` removes
     the marker entirely."""
     description = description or ""
     if not meta:
@@ -59,7 +54,6 @@ def _write_defer_meta(description, meta: dict) -> str:
     return marker
 
 
-# @PUBLIC_HELPER
 def _task_defer_state(task: dict) -> dict:
     """The task's deferral state (``deferred_until`` / ``defer_reason`` /
     ``defer_count`` / ``defer_history`` / ``wake_trigger``), or {} if none. Reads the
@@ -70,7 +64,6 @@ def _task_defer_state(task: dict) -> dict:
     return _extract_defer_meta(task.get("description"))
 
 
-# @PUBLIC_HELPER
 def _defer_count(task: dict) -> int:
     """Non-negative integer ``defer_count`` from the task's defer state; 0 when
     absent or malformed. A JSON bool never counts as a number."""

@@ -61,13 +61,13 @@ do / shrink / park / kill — deferring again is not among them.
 ### `triage_park` / `triage_parked` — read the desk, don't organize it
 
 Park a whole speculative project tree aside in one gesture so the work that matters can
-speak. Durable, reversible, per-user; never touches Vikunja, never deletes a task, never
+speak. Durable (stored in your config file), reversible; never touches Vikunja, never deletes a task, never
 marks anything done.
 
 ### `today_set_weights` / `today_get_weights` — argue with the ranking
 
 If the ordering is wrong for you, retune the scoring weights at runtime — no code
-change, no redeploy. Overrides are per-user and every later deterministic run honors
+change, no redeploy. Overrides are saved in your config file and every later deterministic run honors
 them.
 
 Two of them have a ceiling, and it is worth knowing before you tune. The overdue and
