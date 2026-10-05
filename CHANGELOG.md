@@ -39,8 +39,8 @@ instance health checks. **73 tools → 81.**
 
 ### Fixed
 
-- **The package imports.** 0.9.3 could not be imported at all. This release is verified
-  end to end: a clean install, then an MCP handshake that returns the full tool list.
+- **Verified end to end.** This release is built as a wheel, installed into a clean
+  environment, and driven through an MCP handshake that returns the full tool list.
 - `markdown` and `cryptography` are now declared as dependencies. They were imported and
   undeclared, so installs could fail on first use.
 - The server reports **its own version** in the MCP handshake. It previously reported the
