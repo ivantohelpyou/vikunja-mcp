@@ -26,15 +26,12 @@ from pathlib import Path
 from typing import Optional
 import base64
 import hashlib
-import hmac
 from vikunja_mcp.defer_logic import (  # noqa: E402
-    _DEFER_META_PATTERN,
     _extract_defer_meta,
     _write_defer_meta,
     _task_defer_state,
     _defer_count,
 )
-from starlette.responses import JSONResponse, RedirectResponse, HTMLResponse, Response
 import json
 
 import markdown
@@ -43,7 +40,6 @@ from cryptography.fernet import Fernet
 from fastmcp import FastMCP
 from pydantic import Field
 import requests
-from starlette.requests import Request
 
 logger = logging.getLogger("vikunja-mcp")
 logger.setLevel(logging.DEBUG if os.environ.get("VIKUNJA_DEBUG") else logging.INFO)
@@ -70,8 +66,7 @@ PERF_LOGGING = os.environ.get("VIKUNJA_PERF", "").lower() in ("1", "true", "yes"
 #
 # Resolved ONCE at import rather than per call. A running process cannot change the
 # wheel underneath itself, so this is equivalent — and it has to be a module-level
-# constant rather than a function call, because `mcp = FastMCP(...)` below needs it and
-# the public extraction emits every @PUBLIC_SECTION ahead of every function.
+# constant rather than a function call, because `mcp = FastMCP(...)` below needs it.
 try:
     from importlib.metadata import version as _importlib_version
     try:
@@ -81,52 +76,8 @@ try:
 except Exception:
     _SERVER_VERSION = "unknown"
 
-_current_vikunja_token: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
-    '_current_vikunja_token', default=None
-)
-
-# Companion override for per-request Vikunja base URL (fa-bglr.7). When BOTH this and
-# _current_vikunja_token are set, _get_instance_config returns them regardless of the
-# requested instance name — so the today/triage/assign engine runs as the requesting
-# CALENDAR user (their own Vikunja account), not the configured owner/bot instance.
-# Request-scoped: the calendar endpoint sets these and resets them in a finally.
-_current_vikunja_url: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
-    '_current_vikunja_url', default=None
-)
-
 _allow_instance_fallback: contextvars.ContextVar[bool] = contextvars.ContextVar(
     '_allow_instance_fallback', default=False
-)
-
-# Context variable for current user ID (Matrix/Slack user)
-# This allows instance-aware functions to look up user-specific config from PostgreSQL
-_current_user_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
-    '_current_user_id', default=None
-)
-
-# Context variable for bot mode (vikunja_chat_with_claude / @eis)
-# When True, _request() uses env vars (VIKUNJA_URL + VIKUNJA_BOT_TOKEN) instead of YAML config
-# This separates bot operations from MCP multi-instance configuration (solutions-zja1)
-_bot_mode: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    '_bot_mode', default=False
-)
-
-# Context variable for requesting user (who triggered @eis)
-# Used to auto-share newly created projects with the requester
-_requesting_user: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
-    '_requesting_user', default=None
-)
-_requesting_user_id: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
-    '_requesting_user_id', default=None
-)
-
-# Context variables for project queue batching (solutions-eofy)
-# Accumulates projects during one LLM turn, flushes at end
-_pending_projects: contextvars.ContextVar[Optional[list]] = contextvars.ContextVar(
-    '_pending_projects', default=None
-)
-_next_temp_id: contextvars.ContextVar[int] = contextvars.ContextVar(
-    '_next_temp_id', default=-1
 )
 
 # Request-scoped instance override. Set by write wrappers (task_update, task_delete,
@@ -227,8 +178,8 @@ _SPECIAL_LABEL_COLORS = {
     "calendar": "#4285F4",
     "calendar-busy": "#4caf50",
     "calendar-private": "#9C27B0",
-    "today": "#FF7043",  # today-actions (fa-gptz): swipe-right "do today" marker
-    "anno": "#B8860B",  # fa-20lq: per-task opt-in to yearly auto-rollover of past-due occasions
+    "today": "#FF7043",  # today-actions: swipe-right "do today" marker
+    "anno": "#B8860B",  # per-task opt-in to yearly auto-rollover of past-due occasions
 }
 
 _SPECIAL_LABEL_NAMES = frozenset(_SPECIAL_LABEL_COLORS.keys())
@@ -237,8 +188,8 @@ RESERVED_LABEL_KEYWORDS = {
     "calendar": "Surfaces the task on the calendar and in ICS feeds.",
     "calendar-busy": "Marks the calendar event busy/opaque.",
     "calendar-private": "Marks the calendar event private.",
-    "today": "today-actions 'do today' marker (fa-gptz).",
-    "anno": "Yearly auto-rollover — a past-due occasion rolls to next year (fa-20lq).",
+    "today": "today-actions 'do today' marker.",
+    "anno": "Yearly auto-rollover — a past-due occasion rolls to next year.",
 }
 # Invariant: a reserved label title is exactly a config-backed special label.
 # If these diverge, the special-label resolver and the label_create guard would
@@ -247,7 +198,7 @@ assert set(RESERVED_LABEL_KEYWORDS) == _SPECIAL_LABEL_NAMES, (
     "RESERVED_LABEL_KEYWORDS must stay in lockstep with _SPECIAL_LABEL_NAMES"
 )
 
-# fa-20lq: 'anno' is the per-task opt-in label for yearly auto-rollover. When a
+# 'anno' is the per-task opt-in label for yearly auto-rollover. When a
 # task carries this label and its due date has fully passed, the poller sweep
 # rolls it forward to the next occurrence (see _sweep_anno_rollovers_impl). The
 # roll math is calendar-aware (same month/day next year), which — unlike relying
@@ -272,14 +223,14 @@ _TODAY_DEFAULT_WEIGHTS = {
     "W_TIMEBLOCK": 12,
     "W_QUICK": 5,
     "W_DOOR": 60,         # irreversible-deadline peak; hyperbolic decay by _DOOR_HALFLIFE
-    "W_DEFER": 15,        # per prior deferral: escalation bonus on return (fa-fhtl / spec 07 §3)
+    "W_DEFER": 15,        # per prior deferral: escalation bonus on return
 }
 _W_OVERDUE_CAP = 50       # overdue dominates but never runs away
 _W_DEFER_CAP = 45         # a 3x-deferred task lands in the overdue/door tier — deliberately
 _STALE_WHY = ["", "7d+", "30d+", "90d+"]  # human label per staleness bucket
-_DOOR_HALFLIFE = 7        # days at which the door bonus is half its peak (fa-3729 §1)
+_DOOR_HALFLIFE = 7        # days at which the door bonus is half its peak
 
-# Deferral reason taxonomy (fa-fhtl / spec 07). The picker sorts deferrals from
+# Deferral reason taxonomy. The picker sorts deferrals from
 # defects: only `dread` is a true deferral (increments defer_count, needs a date).
 _DEFER_REASONS = ("blocked", "too_big", "wrong_context", "not_mine", "dread")
 _DEFER_COUNTING_REASONS = frozenset({"dread"})  # the only reasons that bump defer_count
@@ -287,15 +238,7 @@ _RULE_OF_THREE = 3        # on the 3rd `dread` defer, "Not today" → portfolio 
 
 _N_PER_CLUSTER = 7  # per-cluster cap — the §5 guardrail against surfacing "everything"
 
-_OWNER_CLAIM_ACTOR = "__owner__"   # legacy owner/bot session with no user id (spec 06 "owner" mode)
-
 _config_lock = threading.Lock()
-
-# Wrapped in a section, not tagged individually: extract_public.py only emits tagged
-# `def`/`async def` (see its line ~118), so a module constant and a `class` are both
-# invisible to it. Without this the public package would ship _assign_apply_guarded and
-# assign_apply while dropping the two names they close over, and every disposition would
-# NameError at runtime (augment review, PR #197).
 
 # The disposition vocabulary, named once. Both surfaces validate against this list.
 ASSIGN_DISPOSITIONS = ("done", "today", "week", "someday", "delete")
@@ -312,7 +255,7 @@ class AssignRefused(Exception):
 
 # Cache for ICS feed content with TTL (instance+label -> (content, timestamp)).
 # Public because _invalidate_ics_cache is: every task mutation calls it, and without
-# the backing dict it raises NameError AFTER the write has already landed (augment #250).
+# the backing dict it raises NameError AFTER the write has already landed.
 _ics_feed_cache: dict = {}
 _ICS_CACHE_TTL_SECONDS = 300  # 5 minutes
 
@@ -325,25 +268,10 @@ def _get_version() -> str:
     return _SERVER_VERSION
 
 
-def _per_user_override() -> bool:
-    """True when a per-user calendar request (fa-bglr.7) has pinned BOTH the URL and
-    token override contextvars via `_acting_as_calendar_user`. While held:
-      - every instance lookup (`_get_instance_config`) resolves to the requesting
-        user's own Vikunja creds, regardless of the requested instance name; and
-      - the task-fetch path MUST stay single-instance — the owner's multi-instance
-        fan-out (`_fetch_*_from_all_instances`) would key results by the OWNER's
-        instance names (dropping the user's tasks in the post-filter) and runs in
-        ThreadPoolExecutor worker threads that don't inherit these contextvars."""
-    return (
-        _current_vikunja_url.get() is not None
-        and _current_vikunja_token.get() is not None
-    )
-
-
 def mcp_tool_with_fallback(func):
     """Decorator for MCP tools that need instance token fallback.
 
-    MCP/CLI tools don't have per-user authentication, so they need to use
+    MCP tools have no per-request authentication, so they use
     the instance token from VIKUNJA_TOKEN env var.
 
     SECURITY: Only use this decorator for MCP tools, never for user-facing handlers.
@@ -494,26 +422,6 @@ def _sanitize_description(desc: str) -> str:
     return html.escape(desc)
 
 
-def _md_to_slack_mrkdwn(text: str) -> str:
-    """Convert standard markdown to Slack mrkdwn format.
-
-    Key differences:
-    - Bold: **text** → *text*
-    - Headers: ## Header → *Header* (Slack has no headers)
-    - Links: [text](url) → <url|text>
-    """
-    if not text:
-        return text
-    # Convert markdown headers to bold (Slack has no header format)
-    # Must be done before **bold** conversion to avoid double-processing
-    text = re.sub(r'^#{1,6}\s+(.+)$', r'*\1*', text, flags=re.MULTILINE)
-    # Convert **bold** to *bold* (Slack uses single asterisks)
-    text = re.sub(r'\*\*([^*]+)\*\*', r'*\1*', text)
-    # Convert [text](url) to <url|text>
-    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<\2|\1>', text)
-    return text
-
-
 def _load_config() -> dict:
     """Load project config from YAML file."""
     if not CONFIG_FILE.exists():
@@ -594,7 +502,7 @@ def _get_instances() -> dict:
 
     # Always include env var instance as 'default' if set (unless explicitly configured)
     env_url = os.environ.get("VIKUNJA_URL")
-    env_token = os.environ.get("VIKUNJA_BOT_TOKEN") or os.environ.get("VIKUNJA_TOKEN")
+    env_token = os.environ.get("VIKUNJA_TOKEN")
     if env_url and env_token and "default" not in instances:
         instances["default"] = {
             "url": env_url.rstrip('/'),
@@ -621,7 +529,7 @@ def _get_current_instance() -> Optional[str]:
 
     config = _load_config()
 
-    # Check mcp_context FIRST - this is what set_active_context uses (solutions-c8sry)
+    # Check mcp_context FIRST - this is what set_active_context uses
     mcp_instance = config.get("mcp_context", {}).get("instance")
     if mcp_instance:
         return mcp_instance
@@ -662,24 +570,15 @@ def _get_instance_config(name: Optional[str] = None) -> tuple[str, str]:
     Returns:
         Tuple of (url, token)
     """
-    # Per-request per-user override (fa-bglr.7): a calendar request acting AS a user
-    # pins every instance lookup to that user's own Vikunja creds. Single-instance by
-    # nature, so the requested `name` is intentionally ignored while the override holds.
-    _ov_url = _current_vikunja_url.get()
-    _ov_token = _current_vikunja_token.get()
-    if _ov_url and _ov_token:
-        return _ov_url.rstrip('/').strip(), _ov_token.strip()
-
     if name is None:
         name = _get_current_instance()
 
     if name is None:
         # Fall back to env vars
         url = os.environ.get("VIKUNJA_URL")
-        token = os.environ.get("VIKUNJA_BOT_TOKEN") or os.environ.get("VIKUNJA_TOKEN")  # Optional - user tokens replace this
+        token = os.environ.get("VIKUNJA_TOKEN")
         if url:
-            # URL is required, token is optional (user tokens stored per-user)
-            # Strip whitespace from both (solutions-zja1)
+            # URL is required; strip whitespace from both
             return url.rstrip('/').strip(), (token or "").strip()
         raise ValueError("No instance configured. Set VIKUNJA_URL or configure instances.")
 
@@ -741,24 +640,16 @@ def _get_instance_token_expires(name: Optional[str] = None) -> Optional[str]:
 
 
 def _get_effective_instance_config() -> tuple[str, str, str]:
-    """Get instance config, preferring user context if available.
+    """Get (instance_name, url, token) for the currently active instance.
 
-    This is the main function that tools should call to get instance config.
-    It checks for user context (Matrix/Slack) and falls back to YAML config
-    for MCP/CLI usage.
+    This is the main function tools call to resolve instance config.
 
     Returns:
         Tuple of (instance_name, url, token)
     """
-    user_id = _current_user_id.get()
-    if user_id:
-        # User context available - use PostgreSQL
-        return _get_user_instance_config(user_id)
-    else:
-        # No user context - use YAML config (MCP/CLI mode)
-        instance = _get_current_instance() or "default"
-        url, token = _get_instance_config(instance)
-        return instance, url, token
+    instance = _get_current_instance() or "default"
+    url, token = _get_instance_config(instance)
+    return instance, url, token
 
 
 def _connect_instance(name: str, url: str, token: str, token_expires: str = "", timezone: str = "") -> dict:
@@ -1044,108 +935,35 @@ def _request(method: str, endpoint: str, allow_instance_fallback: bool = False, 
             cross-instance operations in MCP mode.
         **kwargs: Additional arguments passed to requests.request()
 
-    Token resolution:
-    1. Context variable _current_vikunja_token (set by auth check for user requests)
-    2. Instance token from VIKUNJA_TOKEN env var (ONLY if allow_instance_fallback=True)
+    Token resolution: the instance token (VIKUNJA_TOKEN or the instance's configured
+    token), used only when allow_instance_fallback=True or the call runs under
+    @mcp_tool_with_fallback.
 
     Raises:
         ValueError: If no token is available
     """
-    # Get URL and default token from instance config
-    # Three modes:
-    # 1. User context (Matrix/Slack): Get from PostgreSQL
-    # 2. Bot mode (@eis): Get from env vars (VIKUNJA_URL + VIKUNJA_BOT_TOKEN)
-    # 3. MCP/CLI mode: Get from YAML config (multi-instance)
-    user_id = _current_user_id.get()
-    bot_mode = _bot_mode.get()
-
-    if _per_user_override():
-        # fa-bglr.7: a per-user calendar request has pinned this user's url+token for
-        # the whole request. Honor it directly (via the same override branch in
-        # _get_instance_config) so we don't re-resolve the user's instance from the DB
-        # on EVERY _request, and so reads/writes hit the USER's own Vikunja. The token
-        # itself is picked up from the contextvar below.
+    # Single-server default: VIKUNJA_URL (+ VIKUNJA_TOKEN) when no explicit instance=
+    # is requested; otherwise the multi-instance YAML config.
+    env_url = os.environ.get("VIKUNJA_URL", "").rstrip('/').strip()
+    if instance is None and env_url:
+        base_url = env_url
+        instance_token = (os.environ.get("VIKUNJA_TOKEN") or "").strip()
+        logger.debug(f"[_request] env VIKUNJA_URL default: url={base_url}")
+    else:
         base_url, instance_token = _get_instance_config(instance)
-        logger.debug(f"[_request] Per-user override: url={base_url}")
-    elif user_id:
-        # User context available - get URL from PostgreSQL
-        instance_name, base_url, instance_token = _get_user_instance_config(user_id)
-        logger.debug(f"[_request] User context: user={user_id}, instance={instance_name}, url={base_url}")
-    elif bot_mode:
-        # Bot mode (@eis) - use env vars, NOT YAML config (solutions-zja1)
-        base_url = os.environ.get("VIKUNJA_URL", "")
-        instance_token = os.environ.get("VIKUNJA_BOT_TOKEN", "")
-        if base_url:
-            base_url = base_url.rstrip('/').strip()
-        if instance_token:
-            instance_token = instance_token.strip()
-        logger.debug(f"[_request] Bot mode: using env vars, url={base_url}")
-    else:
-        # No user context and not bot_mode.
-        # fa-3n7a: a context-less request must NOT silently fall through to a YAML
-        # *default* instance that points at a different server. In prod the YAML/env
-        # default was app.vikunja.cloud (the PUBLIC cloud), so any context-less
-        # _request hit the wrong server and 401'd a valid Factumerit token — the deeper
-        # version of the fa-f3ir /do-confirm misroute. Whenever this deployment sets
-        # VIKUNJA_URL (single-server bot/CLI), honor it as the safe default. Only an
-        # EXPLICIT `instance=` override (a genuine cross-instance MCP op) still resolves
-        # via the multi-instance YAML config. Multi-instance users leave VIKUNJA_URL
-        # unset, so their default-instance behavior is unchanged.
-        env_url = os.environ.get("VIKUNJA_URL", "").rstrip('/').strip()
-        if instance is None and env_url:
-            base_url = env_url
-            instance_token = (os.environ.get("VIKUNJA_BOT_TOKEN")
-                              or os.environ.get("VIKUNJA_TOKEN") or "").strip()
-            logger.debug(f"[_request] No user context; env VIKUNJA_URL default: url={base_url}")
-        else:
-            base_url, instance_token = _get_instance_config(instance)
-            logger.debug(f"[_request] No user context, using YAML config: url={base_url}, instance={instance or 'default'}")
+        logger.debug(f"[_request] YAML config: url={base_url}, instance={instance or 'default'}")
 
-    # Check context var first (per-user token set by auth check)
-    token = _current_vikunja_token.get()
-    if token:
-        # NEVER log token material (not even a prefix): per-user calendar requests now
-        # funnel real user bearers through here (fa-bglr.7 / auggie HIGH). Length only.
-        logger.debug(f"[_request] Using user token from context var (length={len(token)})")
-    else:
-        logger.debug(f"[_request] No user token in context var")
-
-    # SECURITY: Only fall back to instance token if explicitly allowed
-    # This prevents user requests from accidentally using the admin token
-    if not token:
-        # Check both parameter AND context var for fallback permission
-        fallback_allowed = allow_instance_fallback or _allow_instance_fallback.get()
-        if fallback_allowed:
-            token = instance_token
-            # Length only — never log token material (auggie HIGH).
-            logger.debug(f"Using instance fallback token for {method} {endpoint} "
-                         f"(length={len(instance_token) if instance_token else 0})")
-        else:
-            # Log security event - this should not happen if auth check is working
-            logger.warning(
-                f"SECURITY: No user token set for {method} {endpoint}. "
-                "This may indicate a missing auth check. Rejecting request."
-            )
-            raise ValueError(
-                "No Vikunja token available. Please connect with !vik first."
-            )
+    # SECURITY: only use the instance token if explicitly allowed (the parameter, or
+    # the @mcp_tool_with_fallback decorator that every MCP tool runs under).
+    fallback_allowed = allow_instance_fallback or _allow_instance_fallback.get()
+    if not fallback_allowed:
+        logger.warning(f"No token fallback permitted for {method} {endpoint}; rejecting request.")
+        raise ValueError("No Vikunja token available (instance token fallback not permitted)")
+    token = instance_token
+    logger.debug(f"[_request] instance token length={len(token) if token else 0}")
 
     if not token:
-        raise ValueError("No Vikunja token available")
-
-    # fa-f3ir diagnostic: the confirm /do path 401s on DELETE despite a valid token.
-    # Log (no token material) which branch chose the token and its shape for the rare
-    # destructive DELETE, so we can see if _request is sending a different token than
-    # the confirm handler set in the context var.
-    if method == "DELETE":
-        _t = token or ""
-        _k = ("empty" if not _t else "api" if _t.startswith("tk_")
-              else "jwt" if _t.startswith("ey") else "other")
-        logger.info(
-            f"[_request] DELETE {endpoint} token_len={len(_t)} token_kind={_k} "
-            f"from_ctx={bool(_current_vikunja_token.get())} bot_mode={bot_mode} "
-            f"user_ctx={bool(user_id)} base_url={base_url}"
-        )
+        raise ValueError("No Vikunja token available. Set VIKUNJA_TOKEN or configure an instance.")
 
     full_url = f"{base_url}{endpoint}"
     headers = {
@@ -1323,7 +1141,7 @@ def _format_label(label: dict) -> dict:
 def _label_metadata(label: dict) -> dict:
     """Parse a Vikunja label's ``description`` field as JSON metadata.
 
-    The "fa-3lri pattern" (see docs/specifications/today/02-label-metadata.md): a label's
+    The label-metadata pattern: a label's
     description holds a JSON object of attributes, turning a flat string label
     into a programmable, cross-cutting metadata slot — no Vikunja schema change.
 
@@ -1401,26 +1219,7 @@ def _get_project_impl(project_id: int, instance: str = None) -> dict:
 
 
 def _create_project_impl(title: str, description: str = "", hex_color: str = "", parent_project_id: int = 0) -> dict:
-    """Create a project - routes to queue system for bot mode, direct creation for MCP mode.
-
-    Bead: solutions-eofy
-
-    Bot mode (EARS @mentions): Queue project for user to create with their session token.
-    MCP mode (Claude Desktop): Create project directly with user's token (works fine).
-    """
-    # Check if we're in bot mode (Vikunja EARS) vs MCP mode (Claude Desktop)
-    bot_mode = _bot_mode.get()
-
-    if bot_mode:
-        # Bot mode: Use queue system (solutions-eofy)
-        return _create_project_impl_queue(title, description, hex_color, parent_project_id)
-    else:
-        # MCP mode: Direct creation (existing behavior)
-        return _create_project_impl_direct(title, description, hex_color, parent_project_id)
-
-
-def _create_project_impl_direct(title: str, description: str = "", hex_color: str = "", parent_project_id: int = 0) -> dict:
-    """Direct project creation for MCP mode - user's token, works fine."""
+    """Create a project, sharing it with the parent project's users when it is a subproject."""
     # Security: Sanitize title (strip HTML)
     data = {"title": _sanitize_title(title)}
     if description:
@@ -1434,108 +1233,7 @@ def _create_project_impl_direct(title: str, description: str = "", hex_color: st
     project = _format_project(response)
     new_project_id = project.get("id")
 
-    # fa-s965.2 create-hook: instantly grant the assistant (dispatcher subscribe + actor
-    # read/write) access to a project the assistant just created for a Factumerit user, so
-    # @mentions in it work immediately instead of waiting for the periodic sweep (Phase 2a).
-    # Keyed on `_current_user_id` — the SAME user context `_request` used to create the
-    # project (dispatch/handler paths); `_requesting_user` is bot-mode-only and this direct
-    # path is non-bot-mode, so it would be None here. normalize_vikunja_user_id handles
-    # 2/3-element ids and never double-prefixes (auggie). BEST-EFFORT: never fail creation
-    # on a grant hiccup. Plain Claude Desktop has no `_current_user_id` → skipped;
-    # UI-created projects are covered by the sweep.
-    _grant_hook_uid = _current_user_id.get()
-    if new_project_id and _grant_hook_uid:
-        try:
-            from .bot_provisioning import grant_project, normalize_vikunja_user_id
-            _gr = grant_project(normalize_vikunja_user_id(_grant_hook_uid), new_project_id)
-            logger.info(f"[project_create] fa-s965.2 grant p{new_project_id}: {_gr.get('status')}")
-        except Exception as e:
-            logger.warning(f"[project_create] fa-s965.2 grant hook failed for p{new_project_id}: {e}")
-
     shared_with = []
-
-    # Auto-transfer: If bot created this project, clone it to owner's account (solutions-2x6i)
-    # DISABLED: Project cloning disabled due to JWT token expiry issues (solutions-eofy)
-    # Owner JWT tokens expire after 24 hours, but we only store them once during signup.
-    # This causes cloning to fail for users who haven't logged in recently.
-    #
-    # Alternative approach: Bot creates project and shares it with owner (see fallback sharing below).
-    # Owner can access bot-owned projects just fine - they just don't "own" them.
-    #
-    # TODO: Implement one of these solutions:
-    # 1. Store owner credentials (encrypted) and get fresh JWT on demand
-    # 2. Implement JWT refresh token flow
-    # 3. Accept that projects are bot-owned and shared with users
-    requesting_user = _requesting_user.get()
-    if False and new_project_id and requesting_user:  # Disabled for now
-        try:
-            from .project_cloner import clone_project_to_user
-            from .bot_provisioning import get_bot_owner_token, get_user_bot_credentials
-            from .bot_jwt_manager import get_bot_jwt
-            from .token_broker import get_user_token, AuthRequired
-
-            # Get bot's JWT token (to read bot's project)
-            # Bot API tokens are broken (Vikunja issue #105), so we use JWT auth
-            user_id_for_lookup = f"vikunja:{requesting_user}"
-            bot_token = None
-
-            bot_creds = get_user_bot_credentials(user_id_for_lookup)
-            if bot_creds:
-                bot_username, bot_password = bot_creds
-                bot_token = get_bot_jwt(bot_username, bot_password, os.environ.get("VIKUNJA_URL", "https://vikunja.factumerit.app"))
-                logger.info(f"[project_create] Got bot JWT token for {bot_username}")
-
-            # Get user's JWT token (to create project in user's account)
-            # First check personal_bots table (stored during signup)
-            # Then fall back to token_broker (OIDC-authenticated users)
-            user_token = None
-
-            user_token = get_bot_owner_token(user_id_for_lookup)
-            if user_token:
-                logger.info(f"[project_create] Using owner token from personal_bots for {requesting_user}")
-            else:
-                # Fall back to OIDC token
-                try:
-                    user_token = get_user_token(
-                        user_id=requesting_user,
-                        purpose="clone_bot_project",
-                        caller="server._create_project_impl"
-                    )
-                    logger.info(f"[project_create] Using OIDC token from token_broker for {requesting_user}")
-                except AuthRequired as e:
-                    logger.info(f"[project_create] User {requesting_user} has no token (not in personal_bots or token_broker), skipping clone: {e}")
-                    # Fall through to return bot's project (still works, just not in user's account)
-
-            if bot_token and user_token:
-                logger.info(f"[project_create] Cloning bot project {new_project_id} to user {requesting_user}")
-
-                # Clone project from bot's account to user's account
-                result = clone_project_to_user(
-                    bot_project_id=new_project_id,
-                    target_user_token=user_token,
-                    bot_token=bot_token,  # Bot's JWT token (not broken API token)
-                    parent_project_id=parent_project_id,
-                    delete_original=True  # Delete bot's copy after cloning
-                )
-
-                if result["success"]:
-                    # Return the user's project instead of bot's project
-                    user_project_id = result["user_project_id"]
-                    logger.info(f"[project_create] Successfully cloned: bot#{new_project_id} → user#{user_project_id}")
-
-                    # Fetch and return the user's project
-                    user_project = _request("GET", f"/api/v1/projects/{user_project_id}")
-                    return _format_project(user_project)
-                else:
-                    logger.error(f"[project_create] Clone failed: {result.get('error')}")
-                    # Fall through to return bot's project
-            else:
-                logger.info(f"[project_create] Skipping clone (bot_token={bool(bot_token)}, user_token={bool(user_token)})")
-        except AuthRequired as e:
-            # User hasn't authenticated - this is expected for users who haven't done OIDC yet
-            logger.info(f"[project_create] User {requesting_user} not authenticated, skipping clone: {e}")
-        except Exception as e:
-            logger.error(f"[project_create] Failed to clone project to user: {e}", exc_info=True)
 
     # Auto-share: If this is a subproject, inherit users from parent
     if parent_project_id and new_project_id:
@@ -1570,202 +1268,18 @@ def _create_project_impl_direct(title: str, description: str = "", hex_color: st
         except Exception as e:
             logger.warning(f"[project_create] Failed to inherit users from parent: {e}")
 
-    # Fallback sharing: Share bot's project with requesting user
-    # This ensures users can access bot-created projects with admin rights
-    # Uses bot's JWT token to share (bot owns the project)
-    # Uses requesting_user_id directly (no user search needed - passed from poller)
-    requesting_user_id = _requesting_user_id.get()
-    if new_project_id and requesting_user_id:
-        # Skip if already shared via cloning or parent inheritance
-        if not requesting_user or requesting_user.lower() not in [u.lower() for u in shared_with]:
-            try:
-                from .bot_provisioning import get_user_bot_credentials
-                from .bot_jwt_manager import get_bot_jwt
-                import httpx
-
-                # Get bot's JWT token (to share the project it owns)
-                user_id_for_lookup = f"vikunja:{requesting_user}" if requesting_user else None
-                bot_token = None
-
-                if user_id_for_lookup:
-                    bot_creds = get_user_bot_credentials(user_id_for_lookup)
-                    if bot_creds:
-                        bot_username, bot_password = bot_creds
-                        bot_token = get_bot_jwt(bot_username, bot_password, os.environ.get("VIKUNJA_URL", "https://vikunja.factumerit.app"))
-                        logger.info(f"[project_create] Got bot JWT token for sharing: {bot_username}")
-
-                if not bot_token:
-                    logger.warning(f"[project_create] No personal bot found for {requesting_user} - user may be legacy account created before bot provisioning was added. Projects will be created in shared bot account.")
-                else:
-                    vikunja_url = os.environ.get("VIKUNJA_URL", "https://vikunja.factumerit.app")
-
-                    # Share project using bot's JWT token (bot owns it)
-                    # Use requesting_user (username) - Vikunja API expects "username" field, not "user_id"
-                    # See: solutions-2x6i, 111-BOT_PROJECT_SHARING_BUG.md
-                    logger.info(f"[project_create] Sharing project {new_project_id} with user {requesting_user}")
-                    share_resp = httpx.put(
-                        f"{vikunja_url}/api/v1/projects/{new_project_id}/users",
-                        headers={"Authorization": f"Bearer {bot_token}"},
-                        json={
-                            "username": requesting_user,  # Vikunja expects "username", not "user_id"
-                            "right": 2  # Admin access
-                        },
-                        timeout=10
-                    )
-                    share_resp.raise_for_status()
-                    shared_with.append(requesting_user)
-                    logger.info(f"[project_create] Successfully shared bot project with {requesting_user}")
-            except Exception as e:
-                logger.warning(f"[project_create] Failed to auto-share with {requesting_user}: {e}")
-
-    # Auto-share dispatcher bot (read-only) + personal bot (read/write) with new projects
-    # created via MCP server. This enables @mentions and personal bot writes. (fa-n5lm)
-    # Implicit consent: if you create via the bot, you want the bot there.
-    if new_project_id and requesting_user:
-        try:
-            from .bot_provisioning import get_user_bot_credentials, get_user_bot_vikunja_id
-            from .bot_jwt_manager import get_bot_jwt
-            import httpx
-
-            vikunja_url = os.environ.get("VIKUNJA_URL", "https://vikunja.factumerit.app")
-            user_id_str = f"vikunja:{requesting_user}"
-
-            # Get personal bot's JWT token (bot owns the project, can share it)
-            personal_creds = get_user_bot_credentials(user_id_str)
-            if personal_creds:
-                pb_username, pb_password = personal_creds
-                pb_token = get_bot_jwt(pb_username, pb_password, vikunja_url)
-
-                if pb_token:
-                    # Share dispatcher bot (read-only) for @mention detection
-                    dispatch_creds = get_user_bot_credentials("system:dispatcher")
-                    if dispatch_creds:
-                        dispatch_bot = BotVikunjaClient(user_id="system:dispatcher")
-                        dispatch_vikunja_id = dispatch_bot.get_bot_user_id()
-                        try:
-                            resp = httpx.put(
-                                f"{vikunja_url}/api/v1/projects/{new_project_id}/users",
-                                headers={"Authorization": f"Bearer {pb_token}"},
-                                json={"user_id": str(dispatch_vikunja_id), "right": 0},
-                                timeout=10
-                            )
-                            if resp.status_code != 409:
-                                resp.raise_for_status()
-                            logger.info(f"[project_create] Shared dispatcher (read-only) with project {new_project_id}")
-                        except Exception as e:
-                            logger.debug(f"[project_create] Dispatcher share: {e}")
-
-                    # Share personal bot (read/write) for writing responses
-                    personal_vikunja_id = get_user_bot_vikunja_id(user_id_str)
-                    if personal_vikunja_id:
-                        try:
-                            resp = httpx.put(
-                                f"{vikunja_url}/api/v1/projects/{new_project_id}/users",
-                                headers={"Authorization": f"Bearer {pb_token}"},
-                                json={"user_id": str(personal_vikunja_id), "right": 1},
-                                timeout=10
-                            )
-                            if resp.status_code != 409:
-                                resp.raise_for_status()
-                            logger.info(f"[project_create] Shared personal bot (read/write) with project {new_project_id}")
-                        except Exception as e:
-                            logger.debug(f"[project_create] Personal bot share: {e}")
-        except Exception as e:
-            logger.warning(f"[project_create] Failed to auto-share bots: {e}")
-
     if shared_with:
         project["shared_with"] = shared_with
 
-    _invalidate_project_instance_cache()  # fa-tghu: project set changed
-    _invalidate_project_colors_cache()    # fa-doh7: project set changed
+    _invalidate_project_instance_cache()  # project set changed
+    _invalidate_project_colors_cache()    # project set changed
     return project
-
-
-def _create_project_impl_queue(title: str, description: str = "", hex_color: str = "", parent_project_id: int = 0) -> dict:
-    """Queue project for user-side creation (bot mode only).
-
-    Bead: solutions-eofy
-
-    Instead of bot creating the project (which causes permission issues),
-    we queue the project spec for the user's frontend to create using their
-    active session token. This ensures:
-    - User owns the project from the start
-    - No token expiry issues (uses active session)
-    - Bot gets access (user shares back)
-
-    Supports batching: Multiple project_create calls in one LLM turn are
-    batched into a single queue entry with projects as JSON array.
-    """
-    # Security: Sanitize title (strip HTML)
-    sanitized_title = _sanitize_title(title)
-
-    # Get user context
-    requesting_user = _requesting_user.get()  # e.g., "ivan"
-    requesting_user_id = _requesting_user_id.get()  # Numeric ID from bot mode
-
-    if not requesting_user:
-        logger.warning("[create_project_queue] No requesting_user, falling back to direct creation")
-        return _create_project_impl_direct(sanitized_title, description, hex_color, parent_project_id)
-
-    # Construct user_id for bot_provisioning lookup
-    # Bot mode uses "vikunja:username" format
-    user_id = f"vikunja:{requesting_user}"
-
-    # Get bot username for sharing back
-    try:
-        from .bot_provisioning import get_user_bot_credentials
-    except ImportError:
-        # Bot provisioning is server-side and unpublished. Fall back to the same direct
-        # path this function already takes when there is no requesting user (fa-sxac).
-        logger.warning("[create_project_queue] bot_provisioning unavailable — creating directly")
-        return _create_project_impl_direct(sanitized_title, description, hex_color, parent_project_id)
-    bot_username = None
-    bot_creds = get_user_bot_credentials(user_id)
-    if bot_creds:
-        bot_username, _ = bot_creds
-
-    if not bot_username:
-        logger.warning(f"[create_project_queue] No bot found for {requesting_user} (user_id={user_id}), falling back to direct creation")
-        return _create_project_impl_direct(sanitized_title, description, hex_color, parent_project_id)
-
-    # Check if we're in batch mode (LLM creating multiple projects)
-    pending = _pending_projects.get()
-    if pending is None:
-        # Initialize batch mode for this LLM turn
-        pending = []
-        _pending_projects.set(pending)
-
-    # Assign temporary negative ID for parent references
-    temp_id = _next_temp_id.get()
-    _next_temp_id.set(temp_id - 1)
-
-    # Add to batch
-    project_spec = {
-        "temp_id": temp_id,
-        "title": sanitized_title,
-        "description": description,
-        "hex_color": hex_color,
-        "parent_project_id": parent_project_id
-    }
-    pending.append(project_spec)
-
-    logger.info(f"[create_project_queue] Queued project '{sanitized_title}' (temp_id={temp_id}) for {requesting_user}")
-
-    # Return temp project (will be flushed at end of LLM turn)
-    return {
-        "id": temp_id,  # Negative temp ID
-        "title": sanitized_title,
-        "description": description,
-        "hex_color": hex_color,
-        "parent_project_id": parent_project_id,
-        "status": "queued_for_creation"
-    }
 
 
 def _delete_project_impl(project_id: int) -> dict:
     _request("DELETE", f"/api/v1/projects/{project_id}")
-    _invalidate_project_instance_cache()  # fa-tghu: project set changed
-    _invalidate_project_colors_cache()    # fa-doh7: project set changed
+    _invalidate_project_instance_cache()  # project set changed
+    _invalidate_project_colors_cache()    # project set changed
     return {"deleted": True, "project_id": project_id}
 
 
@@ -1791,74 +1305,6 @@ def _get_project_users_impl(project_id: int) -> dict:
     }
 
 
-def _share_project_impl(project_id: int, username: str = "", user_id: int = 0, right: int = 2) -> dict:
-    """Share a project with a user by username.
-
-    Args:
-        project_id: Project to share
-        username: Username to share with (required - Vikunja API uses username)
-        user_id: Deprecated - Vikunja API doesn't accept user_id, only username
-        right: Permission level (0=read, 1=read+write, 2=admin). Default is admin.
-
-    Returns:
-        Success/failure status
-    """
-    # Vikunja API uses username, not user_id
-    if not username:
-        return {"error": "Username is required (Vikunja API uses username, not user_id)"}
-
-    # Get requesting user's token for the share call
-    # Bot tokens can't share projects - need user's own token
-    requesting_user = _requesting_user.get()
-    user_token = None
-    if requesting_user:
-        try:
-            from .token_broker import get_user_token
-            # User ID format is "vikunja:username" - need to construct it
-            token_user_id = f"vikunja:{requesting_user}"
-            user_token = get_user_token(
-                user_id=token_user_id,
-                purpose="share_project",
-                caller="server._share_project_impl"
-            )
-            logger.info(f"[share_project] Got user token for {requesting_user}")
-        except Exception as e:
-            logger.warning(f"[share_project] Could not get user token: {e}")
-
-    # Add user to project - Vikunja API uses username, not user_id
-    try:
-        if user_token:
-            # Use user's token for sharing (bot token can't share)
-            import httpx
-            base_url = os.environ.get("VIKUNJA_URL", "https://vikunja.factumerit.app").rstrip("/")
-            resp = httpx.put(
-                f"{base_url}/api/v1/projects/{project_id}/users",
-                headers={"Authorization": f"Bearer {user_token}"},
-                json={"username": username, "right": right},
-                timeout=30.0,
-            )
-            if resp.status_code >= 400:
-                return {"error": f"Share failed: {resp.status_code} - {resp.text}"}
-            logger.info(f"[share_project] Shared project {project_id} with {username} using user token")
-        else:
-            # Use bot token - should work now with username
-            _request("PUT", f"/api/v1/projects/{project_id}/users", json={
-                "username": username,
-                "right": right
-            })
-
-        right_names = {0: "read", 1: "read+write", 2: "admin"}
-        return {
-            "success": True,
-            "project_id": project_id,
-            "user_id": user_id,
-            "username": username or requesting_user,
-            "right": right_names.get(right, str(right))
-        }
-    except Exception as e:
-        return {"error": f"Failed to share project: {e}"}
-
-
 def _update_project_impl(project_id: int, title: str = "", description: str = "", hex_color: str = "", parent_project_id: int = -1, position: float = -1) -> dict:
     """Update a project's properties. Use parent_project_id=0 to move to root."""
     # GET current project state (Vikunja API replaces, so we merge)
@@ -1878,7 +1324,7 @@ def _update_project_impl(project_id: int, title: str = "", description: str = ""
         current["position"] = position
 
     response = _request("POST", f"/api/v1/projects/{project_id}", json=current)
-    _invalidate_project_colors_cache()  # fa-doh7: hex_color may have changed
+    _invalidate_project_colors_cache()  # hex_color may have changed
     return _format_project(response)
 
 
@@ -1892,7 +1338,7 @@ def _export_all_projects_impl(include_comments: bool = False) -> dict:
     ]
 
     # raise_on_error: a backup must fail loudly rather than quietly omit
-    # whatever came after a mid-pagination failure (fa-k5hw).
+    # whatever came after a mid-pagination failure.
     projects = _fetch_all_pages("GET", "/api/v1/projects", per_page=50, max_pages=100,
                                 raise_on_error=True)
     export = {
@@ -2321,17 +1767,10 @@ def project_create(
     parent_project_id: int = Field(default=0, description="Parent project ID for nesting (0 = top-level)")
 ) -> dict:
     """
-    Queue a new Vikunja project for creation.
+    Create a new Vikunja project.
 
-    IMPORTANT: When called from Vikunja bot (@eis), projects are NOT created instantly.
-    Instead, they are queued for the user to create. The user will receive a link to
-    complete the creation process using their active Vikunja session.
-
-    Returns a queued project spec with status "queued_for_creation".
-    The user must click the provided link to finalize creation.
-
-    Use parent_project_id to create nested/child projects.
-    Multiple projects created in one turn are batched together.
+    Use parent_project_id to create nested/child projects; a subproject inherits the
+    parent project's user shares.
     """
     return _create_project_impl(title, description, hex_color, parent_project_id)
 
@@ -2769,32 +2208,11 @@ def _add_label_to_task_impl(task_id: int, label_id: int) -> dict:
     # Adding one removes the others.
     _calendar_label_mutual_exclusion(task_id, label_id)
 
-    try:
-        _request("PUT", f"/api/v1/tasks/{task_id}/labels", json={"label_id": label_id})
-    except ValueError as e:
-        # A label id Vikunja no longer knows (deleted + recreated) → drop this
-        # account's per-user cache so the next resolve name-scans (today/08 §5;
-        # auggie #2 MEDIUM). Then re-raise: the caller still sees the failure.
-        if _per_user_override() and _label_not_found_error(e):
-            uid = _current_user_id.get() or ""
-            if uid:
-                try:
-                    from . import label_cache
-                    label_cache.forget(uid, _account_key(""))
-                except ImportError:
-                    pass  # server-side cache; absent in the extracted package (fa-sxac)
-        raise
+    _request("PUT", f"/api/v1/tasks/{task_id}/labels", json={"label_id": label_id})
     # Invalidate caches since label may be "calendar"
     _invalidate_ics_cache(_get_current_instance())
     _invalidate_task_list_cache()
     return {"task_id": task_id, "label_id": label_id, "added": True}
-
-
-def _label_not_found_error(e: Exception) -> bool:
-    """Vikunja's answer to a label id that doesn't exist: 404, or 400 with the
-    'label does not exist' code (4004)."""
-    msg = str(e)
-    return "API error (404)" in msg or ('"code":4004' in msg) or ("label does not exist" in msg.lower())
 
 
 def _calendar_label_mutual_exclusion(task_id: int, new_label_id: int) -> None:
@@ -2907,15 +2325,13 @@ def _instances_containing_project(project_id: int) -> list[str]:
 def _resolve_instance_for_project(project_id: int, instance: Optional[str]) -> Optional[str]:
     """Infer the instance that owns project_id when none was explicitly given.
 
-    fa-tghu: MCP task creation should land on the instance that actually owns the
+    MCP task creation should land on the instance that actually owns the
     target project, instead of silently using the current/default instance — which
     otherwise 403s or, worse, creates the task in a same-numbered project on the
     WRONG account. Only fires in multi-instance MCP mode with no explicit instance.
 
     Resolution:
     - explicit instance given            -> honor it (the caller was explicit)
-    - per-user / user-context / bot mode -> current (single effective instance;
-                                            the ambient token already routes right)
     - fewer than 2 instances configured  -> current (nothing to infer)
     - current instance already owns it   -> current (fast path, no misroute possible)
     - exactly one OTHER instance owns it -> that instance (the fix)
@@ -2925,12 +2341,6 @@ def _resolve_instance_for_project(project_id: int, instance: Optional[str]) -> O
         return instance
 
     current = _get_current_instance()
-
-    # Inference is a multi-instance-MCP concern only. In per-user / user-context /
-    # bot mode there is a single effective instance and cross-instance project
-    # fetches would be both wrong (foreign tokens) and costly.
-    if _per_user_override() or _current_user_id.get() or _bot_mode.get():
-        return current
 
     if len(_get_instances()) < 2:
         return current
@@ -2946,7 +2356,7 @@ def _resolve_instance_for_project(project_id: int, instance: Optional[str]) -> O
         return current  # current owns it — no misroute possible, keep it
     if len(owners) == 1:
         logger.info(
-            f"[instance-aware] fa-tghu: project {project_id} routed to "
+            f"[instance-aware] project {project_id} routed to "
             f"'{owners[0]}' (current '{current}' does not own it)"
         )
         return owners[0]
@@ -2998,7 +2408,7 @@ def task_create(
                  1 = repeat monthly (calendar month, ignores repeat_after)
                  2 = next due date calculated from completion (current) date
     """
-    # fa-tghu: land on the instance that actually owns project_id instead of the
+    # land on the instance that actually owns project_id instead of the
     # ambient current/default one (which caused wrong-account creations / 403s).
     requested = instance or None
     resolved = _resolve_instance_for_project(project_id, requested)
@@ -3035,21 +2445,6 @@ def _reserved_label_conflict(title: str) -> Optional[str]:
     return RESERVED_LABEL_KEYWORDS.get((title or "").strip().lower())
 
 
-def _label_cache():
-    """The per-user label cache module, or None where it is not available.
-
-    The cache is server-side (a DB table keyed by user and account) and is not published,
-    so callers must be able to ask for it and carry on without it. Returning None rather
-    than raising lets the per-user branch be skipped as a whole — guarding only the
-    import would leave the four `label_cache.…` calls in that branch undefined (fa-sxac).
-    """
-    try:
-        from . import label_cache
-        return label_cache
-    except ImportError:
-        return None
-
-
 def _get_special_label_id(label_name: str, instance: str = None) -> int:
     """Get label ID for a special (system) label, creating if needed.
 
@@ -3068,36 +2463,6 @@ def _get_special_label_id(label_name: str, instance: str = None) -> int:
     if label_name not in _SPECIAL_LABEL_NAMES:
         # Not a special label — fall back to name-based resolution
         return _find_or_create_label(label_name, _SPECIAL_LABEL_COLORS.get(label_name, "#4caf50"), instance=instance)
-
-    # fa-bglr.7: under a per-user calendar override, the shared config's special_labels
-    # are keyed by the OWNER's instance namespace. A name collision (e.g. both the owner
-    # and the user have an instance called "default") would hand back the OWNER's label
-    # id → a 403 when applied to the USER's task — and writing the user's id back into
-    # the shared config would poison every other user. So resolve straight against the
-    # user's own Vikunja by name-scan/create (these API calls already ride the override
-    # token) and DON'T touch the shared config cache.
-    label_cache = _label_cache()
-    if _per_user_override() and label_cache is not None:
-        # today/08 §5: the per-user cache lives in the DB, keyed (user, plain account
-        # name) — the same key the read surfaces use — so a hit costs no API call and
-        # the shared config is never touched. Absent the cache module we fall through to
-        # the shared-config path below, which is the correct answer, just slower.
-        uid = _current_user_id.get() or ""
-        key = _account_key(instance or "")
-        if uid:
-            cached = label_cache.get(uid, key, label_name)
-            if cached:
-                return cached
-        for label in _list_labels_impl(instance=instance):
-            if label.get("title", "").lower() == label_name.lower():
-                if uid:
-                    label_cache.put(uid, key, label_name, label["id"])
-                return label["id"]
-        new_label = _create_label_impl(
-            label_name, _SPECIAL_LABEL_COLORS.get(label_name, "#4caf50"), instance=instance)
-        if uid:
-            label_cache.put(uid, key, label_name, new_label["id"])
-        return new_label["id"]
 
     instance = instance or _get_current_instance()
     if not instance:
@@ -3204,7 +2569,7 @@ def cal_add_event(
     ## Timezone
     All dates must be UTC (Z suffix). Check the user's timezone before converting
     natural language times — e.g., "noon Pacific" = 20:00Z (PST) or 19:00Z (PDT).
-    User timezone is stored in config under users.{user_id}.timezone_override.
+    The timezone is the `timezone` set on the instance (see instance_connect).
 
     Use cal_get_url to get the subscription URL for Google Calendar/Outlook.
     """
@@ -3296,8 +2661,8 @@ def task_update(
     due_date is for deadlines and the Upcoming view.
 
     TIMEZONE: All dates must be UTC (Z suffix). Check the user's timezone before
-    converting natural language times — stored in config under
-    users.{user_id}.timezone_override (e.g., America/Los_Angeles = PST UTC-8 / PDT UTC-7).
+    converting natural language times — set as the
+    instance's `timezone` (e.g., America/Los_Angeles = PST UTC-8 / PDT UTC-7).
 
     Recurring tasks: Set repeat_after to 0 to disable recurrence, or positive seconds for interval.
     """
@@ -3445,8 +2810,8 @@ def task_set_reminders(
     Each reminder is an ISO datetime when a notification will be sent.
     Pass an empty list to clear all reminders.
 
-    TIMEZONE: Reminder times must be UTC (Z suffix). Check users.{user_id}.timezone_override
-    before converting natural language times (e.g., America/Los_Angeles = UTC-8 PST / UTC-7 PDT).
+    TIMEZONE: Reminder times must be UTC (Z suffix). Check the instance's configured
+    timezone before converting natural language times (e.g., America/Los_Angeles = UTC-8 PST / UTC-7 PDT).
 
     Example: reminders=["2025-12-19T09:00:00Z", "2025-12-19T13:00:00Z"]
     """
@@ -3862,7 +3227,7 @@ def label_create(
     Create a new label.
 
     Returns the created label with its assigned ID. If the title collides with a
-    reserved keyword (fa-2y1n), the label is still created but the result carries
+    reserved keyword, the label is still created but the result carries
     a non-blocking ``reserved_warning`` — the system's own label creation goes
     through _create_label_impl directly and never triggers this.
     """
@@ -4050,7 +3415,6 @@ def _create_view_impl(project_id: int, title: str, view_kind: str, filter_query:
         data["bucket_configuration_mode"] = "manual"
 
     # Add filter if provided (Vikunja expects filter as a string, not an object)
-    # Fix: solutions-nwidy
     if filter_query:
         data["filter"] = filter_query
 
@@ -4102,7 +3466,6 @@ def _update_view_impl(project_id: int, view_id: int, title: str = None, filter_q
         data["title"] = title
     
     # Vikunja expects filter as a string, not an object
-    # Fix: solutions-nwidy
     if filter_query is not None:
         data["filter"] = filter_query
     
@@ -5553,8 +4916,8 @@ def batch_update_tasks(
     Saves round trips when renaming multiple tasks or setting reminders on several tasks.
     Each update must include task_id and any fields to change.
 
-    TIMEZONE: All dates must be UTC (Z suffix). Check users.{user_id}.timezone_override
-    before converting natural language times (e.g., America/Los_Angeles = UTC-8 PST / UTC-7 PDT).
+    TIMEZONE: All dates must be UTC (Z suffix). Check the instance's configured
+    timezone before converting natural language times (e.g., America/Los_Angeles = UTC-8 PST / UTC-7 PDT).
 
     Example:
     updates=[
@@ -5947,64 +5310,6 @@ def _list_project_configs_impl() -> dict:
     return {"projects": projects}
 
 
-def _get_project_ears(project_id: int) -> tuple[bool, str | None]:
-    """Check if ears mode (!ears on) is enabled for a project.
-
-    Returns:
-        Tuple of (enabled, ears_since_timestamp)
-    """
-    config = _load_config()
-    project_config = config.get("projects", {}).get(str(project_id), {})
-    return (
-        project_config.get("capture_enabled", False),  # DB field kept for compatibility
-        project_config.get("capture_since")  # DB field kept for compatibility
-    )
-
-
-def _update_project_ears(project_id: int, enabled: bool):
-    """Enable/disable ears mode (!ears on/off) for a project.
-
-    When enabled, records the current timestamp so only tasks created
-    after this point are processed.
-
-    Args:
-        project_id: Project ID
-        enabled: True to enable, False to disable
-    """
-    config = _load_config()
-    if "projects" not in config:
-        config["projects"] = {}
-    if str(project_id) not in config["projects"]:
-        config["projects"][str(project_id)] = {}
-
-    config["projects"][str(project_id)]["capture_enabled"] = enabled  # DB field kept for compatibility
-
-    if enabled:
-        # Record when ears mode started (only process tasks after this)
-        from datetime import datetime, timezone
-        config["projects"][str(project_id)]["capture_since"] = datetime.now(timezone.utc).isoformat()
-    else:
-        # Clear timestamp when disabled
-        config["projects"][str(project_id)].pop("capture_since", None)
-
-    _save_config(config)
-    logger.info(f"[EARS] Project #{project_id} ears mode: {'ON' if enabled else 'OFF'}")
-
-
-def _get_ears_enabled_projects() -> list[tuple[int, str]]:
-    """Get all projects with ears mode (!ears on) enabled.
-
-    Returns:
-        List of (project_id, ears_since_timestamp) tuples
-    """
-    config = _load_config()
-    enabled = []
-    for pid, pconfig in config.get("projects", {}).items():
-        if pconfig.get("capture_enabled") and pconfig.get("capture_since"):
-            enabled.append((int(pid), pconfig["capture_since"]))
-    return enabled
-
-
 def _create_from_template_impl(
     project_id: int,
     template: str,
@@ -6190,12 +5495,7 @@ def instance_list() -> dict:
     """
     instances = _get_instances()
 
-    # Get current instance - use user context if available
-    user_id = _current_user_id.get()
-    if user_id:
-        current = _get_user_instance(user_id) or "default"
-    else:
-        current = _get_current_instance()
+    current = _get_current_instance()
 
     return {
         "instances": [
@@ -6253,16 +5553,8 @@ def instance_switch(
 
     Returns: {switched_to: str, url: str}
     """
-    # Use user context if available, otherwise use YAML config
-    user_id = _current_user_id.get()
-    if user_id:
-        result = _set_user_instance(user_id, name)
-        if "error" in result:
-            return result
-        url = result.get("url", "")
-    else:
-        _set_current_instance(name)
-        url, _ = _get_instance_config(name)
+    _set_current_instance(name)
+    url, _ = _get_instance_config(name)
 
     return {
         "switched_to": name,
@@ -6415,7 +5707,7 @@ def instance_check_health(
 
 @mcp_tool_with_fallback
 def instance_connect(
-    name: str = Field(description="Name for the instance (e.g., 'cloud', 'factumerit')"),
+    name: str = Field(description="Name for the instance (e.g., 'personal', 'work')"),
     url: str = Field(description="Base URL of the Vikunja instance"),
     token: str = Field(description="API token (or env var reference like '${VIKUNJA_CLOUD_TOKEN}')"),
     token_expires: str = Field(default="", description="Optional: Token expiration date (YYYY-MM-DD) for tracking"),
@@ -6687,21 +5979,12 @@ def _list_all_tasks_impl(
     """Implementation for search_all_tasks - testable without decorator.
 
     include_meta: when True, each task additionally carries start_date, updated,
-    bucket_id, and full labels (id+title+description) for the today-actions scorer
-    (fa-gptz). Default False keeps the lean shape every existing caller — including
+    bucket_id, and full labels (id+title+description) for the today-actions scorer. Default False keeps the lean shape every existing caller — including
     the LLM-facing task_query tool — sees, so enriching costs no extra tokens
     unless a consumer opts in.
     """
     # Check cache first (30s TTL for repeated queries)
     cache_key = f"{filter_due}:{include_done}:{filter}:{page}:{due_after}:{due_before}:{instance}:{project_id}:{include_meta}"
-    # fa-bglr.7: under a per-user calendar override the SAME instance name (commonly
-    # "default") is shared across users, so an instance-keyed cache would let user B
-    # read user A's cached tasks within the TTL. Namespace the key by the acting user's
-    # identity (id, else a token fingerprint) to keep per-user reads isolated.
-    if _per_user_override():
-        ident = _current_user_id.get() or hashlib.sha256(
-            (_current_vikunja_token.get() or "").encode()).hexdigest()[:16]
-        cache_key = f"u={ident}|{cache_key}"
     cached = _get_cached_task_list(cache_key)
     if cached:
         cached["cached"] = True
@@ -6728,28 +6011,19 @@ def _list_all_tasks_impl(
     # Use the requested instance name, or "default" if not specified
     single_instance_name = instance if instance else "default"
 
-    # fa-bglr.7: a per-user calendar request pins the requesting user's own creds via
-    # the override contextvars. It is single-instance by nature, so we must NOT fan out
-    # across the OWNER's configured instances — that would fetch the user's tasks once
-    # per owner-instance, key them by owner-instance names, then drop them all in the
-    # post-filter below (user instance ∉ owner names), AND the fan-out runs in worker
-    # threads that don't inherit the override. Force the single-instance path, keyed by
-    # the requested (user's) instance name so the post-filter at L~8136 still matches.
-    per_user = _per_user_override()
-
     # Fetch all pages unless specific page requested
     if page > 0:
         params["page"] = page
         params["per_page"] = per_page
-        if instances and not per_user:
+        if instances:
             results = _fetch_from_all_instances("GET", endpoint, params=params)
         else:
-            # No configured instances (or per-user override) - use user token directly
+            # No configured instances - use the token directly
             data = _request("GET", endpoint, params=params)
             results = {single_instance_name: data}
     else:
         # Fetch ALL pages
-        if instances and not per_user:
+        if instances:
             # Multi-instance: fetch from all configured instances
             results = _fetch_all_pages_from_all_instances(
                 "GET", endpoint,
@@ -6758,7 +6032,7 @@ def _list_all_tasks_impl(
                 params=params
             )
         else:
-            # Single instance (or per-user override): use user token directly
+            # Single instance: use the token directly
             data = _fetch_all_pages("GET", endpoint, per_page=per_page, max_pages=100, params=params)
             results = {single_instance_name: data}
 
@@ -6907,14 +6181,14 @@ def _list_all_tasks_impl(
                 "done": task.get("done", False),
             }
             if include_meta:
-                # Extra fields powering the today-actions scorer (fa-gptz), opt-in
+                # Extra fields powering the today-actions scorer, opt-in
                 # so the default (and the LLM-facing task_query) stays lean.
                 # start_date drives the timeblock / snooze signals, `updated` drives
                 # staleness, and full label objects (id/title/description) feed the
-                # fa-3lri _label_metadata reader.
+                # _label_metadata reader.
                 row["start_date"] = task.get("start_date")
-                # end_date is what makes a task an EVENT (today/08 §4.2, _task_kind);
-                # without it every passed event reads as an overdue deed (auggie #3 HIGH).
+                # end_date is what makes a task an EVENT;
+                # without it every passed event reads as an overdue deed.
                 row["end_date"] = task.get("end_date")
                 row["updated"] = task.get("updated") or task.get("updated_at")
                 row["bucket_id"] = task.get("bucket_id", 0)
@@ -6922,7 +6196,7 @@ def _list_all_tasks_impl(
                     {"id": l.get("id"), "title": l.get("title"), "description": l.get("description", "")}
                     for l in (task.get("labels") or [])
                 ]
-                # Parsed deferral state (fa-fhtl) powers the escalation term + the
+                # Parsed deferral state powers the escalation term + the
                 # deferred-exclusion; project the small blob, not the full description.
                 defer = _extract_defer_meta(task.get("description"))
                 if defer:
@@ -7164,33 +6438,10 @@ def _task_summary_impl(instance: str = "", project_id: int = 0) -> dict:
 
 
 def _weight_overrides() -> dict:
-    """The raw weight overrides for this actor: the user's `user_settings` row
-    (fa-amnt.7), else the shared config's ``today_actions.weights``.
+    """The raw weight overrides: ``today_actions.weights`` from the config file.
 
-    Weights are stored per USER, not per account — one ranking preference per person,
-    which is exactly the pre-migration semantics. The cross-account deck never compares
-    scores between accounts (it interleaves round-robin, today/08 §6), so per-account
-    weights would buy nothing here; they'd be a new feature, not a migration.
-
-    Never raises: an unreadable store yields {} and the caller keeps pure defaults.
+    Never raises: an unreadable config yields {} and the caller keeps pure defaults.
     """
-    user_id, store = _settings_actor()
-    if user_id:
-        if store is None:
-            return {}                         # defaults, not the owner's overrides
-        try:
-            value = store.get(user_id, store.ALL_ACCOUNTS, store.WEIGHTS)
-            if value is None:                 # no row = never seeded (a successful read)
-                value = _yaml_weights() if _settings_is_config_owner(user_id) else {}
-                store.seed_if_absent(user_id, store.ALL_ACCOUNTS, store.WEIGHTS, value)
-        except store.SettingsUnavailable:
-            return {}                         # store down: defaults, never the file
-        return value or {}
-    return _yaml_weights()
-
-
-def _yaml_weights() -> dict:
-    """``today_actions.weights`` from the shared config; {} when unreadable."""
     try:
         return (_load_config() or {}).get("today_actions", {}).get("weights") or {}
     except Exception:  # noqa: BLE001
@@ -7201,9 +6452,8 @@ def _today_action_weights() -> dict:
     """Resolve today-actions scoring weights: documented defaults overlaid with
     any operator/LLM overrides from the global config store.
 
-    Overrides are PER USER (`user_settings`, fa-amnt.7) for a user actor and the
-    global config for a system one — see `_weight_overrides`. Weights are account-wide,
-    not per-project. A partial override is valid (missing keys keep their default); a
+    Overrides come from the config file — see `_weight_overrides`. Weights are
+    account-wide, not per-project. A partial override is valid (missing keys keep their default); a
     malformed value is ignored. Never raises: an unreadable store yields pure defaults.
     The deterministic engine only READS weights.
     """
@@ -7258,14 +6508,14 @@ def _staleness_bucket(updated, now) -> int:
 
 
 def _task_goal_labels(task: dict) -> list:
-    """Labels on the task whose title is in the `goal:*` namespace (fa-3lri)."""
+    """Labels on the task whose title is in the `goal:*` namespace."""
     return [l for l in (task.get("labels") or [])
             if str(l.get("title") or "").startswith("goal:")]
 
 
 def _task_min_duration(task: dict):
     """Smallest POSITIVE `duration_minutes` declared across the task's labels via
-    the fa-3lri metadata pattern (e.g. a `~15m` label → {"duration_minutes": 15}),
+    the label-metadata pattern (e.g. a `~15m` label → {"duration_minutes": 15}),
     or None if no label carries one. Never guesses from the title. Non-positive
     values (a malformed `~0m`/negative label) are ignored, so they can't masquerade
     as the strongest quick-win signal."""
@@ -7279,12 +6529,12 @@ def _task_min_duration(task: dict):
 
 def _task_door_closes(task: dict):
     """Earliest ``door_closes`` deadline declared across the task's labels via the
-    fa-3lri metadata pattern (a label whose description JSON carries
+    label-metadata pattern (a label whose description JSON carries
     ``{"door_closes": "2026-07-19"}``), as an AWARE datetime, or None.
 
     ``door_closes`` is an IRREVERSIBLE deadline — a one-way door. Unlike due_date
     (overdue is recoverable, stale is recoverable) a closed door is not, so the
-    scorer weights it hyperbolically as the date nears (fa-3729 §1). The EARLIEST
+    scorer weights it hyperbolically as the date nears. The EARLIEST
     door wins: the nearest irreversible deadline is the one that constrains the day.
     Absent/unparseable metadata simply doesn't fire — costs a signal, never a wrong
     answer, mirroring `_task_min_duration`."""
@@ -7299,7 +6549,7 @@ def _task_door_closes(task: dict):
 def _is_today_candidate(task: dict, now, today_ids=()) -> bool:
     """today-actions.md §1 inclusion predicate. A task is a candidate iff it is
     open AND matches >=1 signal: due by end of today, started by end of today,
-    priority >= 3, or is claimed for today (today/08 D3). (Today-kanban-bucket inclusion
+    priority >= 3, or is claimed for today. (Today-kanban-bucket inclusion
     is deferred — bucket-title resolution lands with persistence in Phase 4.)
 
     NOTE: not yet wired into the shipped pool — `_gather_today_candidates` builds
@@ -7352,7 +6602,7 @@ def _score_today_candidate(task: dict, now, weights: dict) -> tuple:
             score += weights["W_DUE_TODAY"]
             why.append("due today")
 
-    # Irreversibility (fa-3729 §1): a `door_closes` deadline is a ONE-WAY door.
+    # Irreversibility: a `door_closes` deadline is a ONE-WAY door.
     # Overdue is recoverable; a closed door is not. The bonus rises hyperbolically
     # as the door nears (rectangular hyperbola in days: peak / (1 + days/halflife)),
     # peaks the day it closes, and — being a fact about the world, not the operator —
@@ -7363,7 +6613,7 @@ def _score_today_candidate(task: dict, now, weights: dict) -> tuple:
         # `door_closes` is a floating LOCAL date ("2026-07-19"), not an absolute instant:
         # compare the calendar day AS WRITTEN against the user's local today. Do NOT
         # astimezone-shift it — parsed as UTC midnight, an astimezone into a negative
-        # offset would slide the door a day early for non-UTC instances (PR #133 review).
+        # offset would slide the door a day early for non-UTC instances.
         days_to_door = (door.date() - now.date()).days
         if days_to_door <= 0:
             score += weights["W_DOOR"]
@@ -7383,7 +6633,7 @@ def _score_today_candidate(task: dict, now, weights: dict) -> tuple:
         score += weights["W_STALE"] * bucket
         why.append(f"stale {_STALE_WHY[bucket]}")
 
-    # Escalation (fa-fhtl / spec 07 §3): a task that has been deferred and has now
+    # Escalation: a task that has been deferred and has now
     # RETURNED gets LOUDER, proportional to how many times it was pushed away —
     # min(W_DEFER * defer_count, cap), the same linear-with-cap idiom as W_OVERDUE.
     # Additive only, never decays downward. A still-deferred task is excluded upstream
@@ -7434,19 +6684,7 @@ def _event_passed(task: dict, now) -> bool:
     return end is not None and end < now
 
 
-def _occasions_map(instance: str = ""):
-    """{task_id: 'MM-DD'} for the actor's account. **None** when the store is
-    unavailable — distinct from an empty map — so the read derives month/day from due
-    dates AND skips the lazy backfill instead of opening one doomed connection per
-    `anno` task on the request path (auggie #3 MEDIUM)."""
-    try:
-        from . import occasions
-        return occasions.for_account(_today_claim_actor(), _backend_key(instance, create=False))
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def _derive_lifecycle(task: dict, now, occ: dict = None, instance: str = ""):
+def _derive_lifecycle(task: dict, now):
     """Apply the kind's lifecycle to a task row for the read surfaces. Returns a COPY
     tagged with `kind`, or None when the task should not surface at all.
 
@@ -7457,12 +6695,10 @@ def _derive_lifecycle(task: dict, now, occ: dict = None, instance: str = ""):
       priority > 0 → kind 'passed' with `ended` — one Reckoning card (D6).
     - anything else: tagged 'deed' / 'event', otherwise untouched.
     """
-    store_up = occ is not None
-    occ = occ or {}
     kind = _task_kind(task)
     out = dict(task)
     if kind == "occasion":
-        md = occ.get(task.get("id")) or _read_anno_md("", fallback_due=task.get("due_date") or "")
+        md = _read_anno_md("", fallback_due=task.get("due_date") or "")
         out["kind"] = "occasion"
         if md:
             try:
@@ -7473,15 +6709,6 @@ def _derive_lifecycle(task: dict, now, occ: dict = None, instance: str = ""):
                 out["occasion_md"] = md
             except (ValueError, TypeError):
                 pass
-            if store_up and task.get("id") not in occ:
-                # Lazy backfill (D2): first sight of an `anno` task with no fact row.
-                # Only when the store answered — a down store is probed once per read
-                # (in _occasions_map), never once per task.
-                try:
-                    from . import occasions
-                    occasions.upsert(_today_claim_actor(), _backend_key(instance), int(task.get("id")), md)
-                except Exception:  # noqa: BLE001
-                    pass
         return out
     if kind == "event":
         end = _event_end(task)
@@ -7512,45 +6739,8 @@ def _is_snoozed(task: dict, now) -> bool:
         return False
 
 
-def _deferrals_map(instance: str = ""):
-    """{task_id: state} from the deferrals table for the actor's account (today/08 D4).
-    None when the store is unavailable — distinct from {} — so the overlay falls back
-    to the description marker AND skips lazy backfill (no per-task probing of a dead
-    store)."""
-    try:
-        from . import deferrals
-        return deferrals.for_account(_today_claim_actor(), _backend_key(instance, create=False))
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def _overlay_deferral(task: dict, dmap, instance: str = "") -> dict:
-    """Return a COPY of a projected task row carrying its deferral state from the
-    TABLE when a row exists (the table wins over the description marker); otherwise
-    the marker's parse — and, when the store answered, file that marker as a row
-    (lazy backfill, D4).
-
-    Never mutates `task`: the rows come from the 30s task-list cache, which is shared
-    across actors outside the per-user override — writing one actor's state into a
-    cached row would let the next actor read (and backfill!) it as their own
-    (auggie #231 MEDIUM)."""
-    out = dict(task)
-    tid = out.get("id")
-    if dmap is not None and tid in dmap:
-        out["defer"] = dict(dmap[tid])
-        return out
-    marker = out.get("defer") if isinstance(out.get("defer"), dict) else None
-    if marker and dmap is not None:
-        try:
-            from . import deferrals
-            deferrals.upsert(_today_claim_actor(), _backend_key(instance), int(tid), marker)
-        except Exception:  # noqa: BLE001
-            pass
-    return out
-
-
 def _is_deferred(task: dict, now) -> bool:
-    """True if the task has a `deferred_until` in the FUTURE (spec 07) — a real
+    """True if the task has a `deferred_until` in the FUTURE — a real
     deferral, so it must not surface today. Mirrors `_is_snoozed` but keys on the
     defer-meta `deferred_until`, not `start_date`. `deferred_until` is a floating
     LOCAL date ("2026-07-20"): compare the day as written against local today (no
@@ -7571,51 +6761,17 @@ def _gather_today_candidates(instance: str = "", now=None, excluded=None) -> lis
     The four primitives ARE the §1 inclusion rules (overdue & due-today,
     priority>=3, and unscheduled floaters that feed *Been waiting*); the enriched
     projection means each carries the start_date / updated / labels the scorer
-    needs. Plus any `today`-labeled task the user swiped in (which the primitives
-    can miss if it's future-dated). Returns tasks sorted by score descending.
+    needs. Returns tasks sorted by score descending.
 
     `excluded` is a set of (instance, project_id) whose tasks must NOT surface in
     "today" — Vikunja-archived AND triage-parked projects both (the caller unions
     them; this fn just honors the set). Park is a sweep-aside, so parked projects
-    are excluded here exactly like archived ones (fa-k374).
+    are excluded here exactly like archived ones.
     """
     if now is None:
         now = _today_now(instance)
     excluded = excluded or set()
     weights = _today_action_weights()
-    occ = _occasions_map(instance)   # D2 fact table; {} degrades to due-month/day
-    dmap = _deferrals_map(instance)  # D4 deferrals table; None = store down (marker only)
-    # today/10: handoffs. Imported HERE, inside a try, for the same reason
-    # `_today_routine_cluster` imports `routines` that way — the private module does not
-    # exist in the extracted public package, and its absence must degrade to "no
-    # handoffs" rather than break the panel.
-    actor = _today_claim_actor()
-    _handoffs = None
-    offered_to_me: set = set()
-    try:
-        # BOTH the import and the owner check live inside the try: `_OWNER_CLAIM_ACTOR`
-        # is a @PRIVATE module constant that public extraction does not emit, so naming
-        # it from this @PUBLIC_HELPER would NameError in the extracted package. A
-        # NameError is an Exception, so it degrades here to "no handoffs" exactly like a
-        # missing module — which is the intended behaviour either way (augment #240).
-        if actor and actor != _OWNER_CLAIM_ACTOR:
-            from . import handoffs as _handoffs  # noqa: F401
-            # Vikunja ids of tasks OFFERED to this person. An offer is an explicit
-            # interpersonal act, so — exactly like a claim — it overrides the snooze and
-            # deferral skips below. Without this, handing over something the recipient
-            # had deferred produced an offer they could never see, while the sender's
-            # panel went on saying "waiting on" them.
-            from . import fe_tasks as _fe
-            for fe_id, row in (_handoffs.for_user(actor) or {}).items():
-                if row.get("state") != _handoffs.OFFERED or row.get("to_user") != actor:
-                    continue
-                proj = _fe.projection_of(fe_id)
-                if proj:
-                    offered_to_me.add((None, int(proj["vikunja_task_id"])))
-    except Exception as e:  # noqa: BLE001
-        _handoffs = None
-        logger.warning("today: handoffs unavailable: %s", e)
-
     sources = [
         _overdue_tasks_impl(instance=instance, include_meta=True),
         _due_today_impl(instance=instance, include_meta=True),
@@ -7623,7 +6779,7 @@ def _gather_today_candidates(instance: str = "", now=None, excluded=None) -> lis
         _unscheduled_tasks_impl(instance=instance, include_meta=True),
     ]
     # Pass 1 — dedupe the RAW rows by (instance, id) and drop excluded projects. The
-    # rows are cache objects: never mutated here or below (auggie #231).
+    # rows are cache objects: never mutated here or below.
     by_key = {}
     for res in sources:
         if not isinstance(res, dict) or "error" in res:
@@ -7633,50 +6789,20 @@ def _gather_today_candidates(instance: str = "", now=None, excluded=None) -> lis
                 continue  # archived or parked project — don't surface
             by_key.setdefault((task.get("instance"), task.get("id")), task)
 
-    # 5th source (#4): tasks the user explicitly claimed for today (today/08 D3),
-    # which the focused-query primitives miss when the task is future-dated. A claim
-    # overrides snooze/deferral (snooze withdraws the claim anyway), but NOT exclusion —
-    # a task in an archived or parked project stays swept even if it was claimed.
-    claimed = set()
-    for task in _today_claimed_tasks(instance, now=now):
-        if (task.get("instance"), task.get("project_id")) in excluded:
-            continue
-        key = (task.get("instance"), task.get("id"))
-        claimed.add(key)
-        by_key.setdefault(key, task)
-
-    # Pass 2 — once per task: deferral overlay (copy), snooze/deferral gates, kind
-    # lifecycle (copy), score. One overlay per task also means one lazy backfill per
-    # task, not one per source it appeared in.
+    # Pass 2 — once per task: snooze/deferral gates, kind lifecycle (copy), score.
     candidates = []
     for key, raw in by_key.items():
-        task = _overlay_deferral(raw, dmap, instance)            # D4: table wins over the marker
-        # An offer overrides snooze/defer for the same reason a claim does: somebody
-        # asked you for this, and a decision you cannot see is not a decision.
-        if key not in claimed and (None, key[1]) not in offered_to_me:
-            if _is_snoozed(task, now):
-                continue  # future start_date = swiped-left / not yet actionable
-            if _is_deferred(task, now):
-                continue  # future deferred_until = a real deferral (spec 07)
-        task = _derive_lifecycle(task, now, occ, instance)       # D2/D6: kinds at read time
+        if _is_snoozed(raw, now):
+            continue  # future start_date = swiped-left / not yet actionable
+        if _is_deferred(raw, now):
+            continue  # future deferred_until = a real deferral
+        task = _derive_lifecycle(raw, now)                       # kinds at read time
         if task is None:
             continue  # a passed, priority-0 event: it happened or it didn't
         score, why = _score_today_candidate(task, now, weights)
         task["score"] = score
         task["why"] = why
         candidates.append(task)
-
-    # ATTRIBUTION (today/10 §3.1). On a shared account both people see every task, so
-    # this is the only thing that can say whose it is: a task someone else ACCEPTED drops
-    # out here, and an OFFER is annotated so the clusterer can lift it into its own
-    # decision cluster. Applied after scoring — scoring does not depend on it, and one
-    # pass over the finished list is cheaper than a lookup inside the loop.
-    if _handoffs is not None:
-        try:
-            candidates = _handoffs.overlay(
-                candidates, actor, _backend_key(instance, create=False))
-        except Exception as e:  # noqa: BLE001
-            logger.warning("today: handoff overlay failed: %s", e)
 
     candidates.sort(key=lambda t: t["score"], reverse=True)
     return candidates
@@ -7720,26 +6846,20 @@ def _cluster_candidates(candidates: list, now, project_names: dict = None, insta
             "title": task.get("title"),
             "score": task.get("score", 0),
             "why": task.get("why", []),
-            # today/08 kind: 'deed' | 'event' | 'occasion' | 'passed' (the panel keys the
-            # card on 'passed' — one "done, or didn't happen?" decision, D6).
+            # kind: 'deed' | 'event' | 'occasion' | 'passed' (the panel keys the
+            # card on 'passed' — one "done, or didn't happen?" decision).
             "kind": task.get("kind") or "deed",
             "ended": task.get("ended"),
-            # spec 07 state (d): at 3 dread defers the card becomes a portfolio
+            # at 3 dread defers the card becomes a portfolio
             # decision (Do/Shrink/Park/Kill, no "Not today") — the panel keys on this.
             "defer_count": _defer_count(task),
             "project": project_names.get((task.get("instance"), task.get("project_id")), ""),
             "context": ctx if ctx is not None else (contexts[0] if contexts else None),
             "instance": task.get("instance"),
-            # cross-instance-safe "open in Vikunja" deep-link (fa-bglr.1): the task's
+            # cross-instance-safe "open in Vikunja" deep-link: the task's
             # OWN instance host, never the viewed one. '' when unresolved.
             "url": _vikunja_task_url(instance_urls.get(task.get("instance"), ""), task.get("id")),
         }
-        # today/10: who sent this and what they said, so the card can render
-        # "Ivan → before the bins go out" without a second round trip. Added ONLY when
-        # there is a live handoff — which is almost never — so the panel payload for
-        # everyone not sharing an account is byte-for-byte what it was.
-        if task.get("handoff"):
-            out["handoff"] = task["handoff"]
         return out
 
     def take(tasks, ctx=None):
@@ -7748,21 +6868,10 @@ def _cluster_candidates(candidates: list, now, project_names: dict = None, insta
 
     clusters = []
 
-    # 0a. Offers (today/10 D2) are a DECISION — accept or decline — not a to-do, so like
-    #     passed events they get their own cluster and stay out of every other one. Only
-    #     offers TO this person: one they SENT is still their own work until answered.
-    offered = [t for t in candidates if (t.get("handoff") or {}).get("stance") == "offered"]
-    candidates = [t for t in candidates
-                  if (t.get("handoff") or {}).get("stance") != "offered"]
-
     # 0. Passed events that carried a priority (D6) are a decision, not a to-do: they
     #    get ONE card in their own cluster and stay out of every other one.
     passed = [t for t in candidates if t.get("kind") == "passed"]
     candidates = [t for t in candidates if t.get("kind") != "passed"]
-
-    handoff_cluster = _today_handoff_cluster(take(offered))
-    if handoff_cluster:
-        clusters.append(handoff_cluster)
 
     # 1. Must clear — due by today OR priority >= 4
     must_clear = [t for t in candidates if _in_must_clear(t, today_end)]
@@ -7857,16 +6966,14 @@ def _today_projects(instance: str = "") -> dict:
 
 def _vikunja_task_url(base_url: str, task_id) -> str:
     """A task's Vikunja front-end URL ({base}/tasks/{id}), or '' if either piece is
-    missing. One shape shared by the today deck (fa-bglr.1) and the assign queue
-    (fa-bglr.9) so their "open in Vikunja" links stay identical."""
+    missing. One shape shared by the today deck and the assign queue so their "open in Vikunja" links stay identical."""
     return f"{base_url}/tasks/{task_id}" if (base_url and task_id is not None) else ""
 
 
 def _instance_url_resolver():
     """A memoized name->front-end-base-URL resolver for cross-instance-safe deep-links.
     Resolving PER instance is the whole point: task ids are per-instance, so one shared
-    base would aim a cross-instance link at the wrong Vikunja and 404 (fa-bglr.1 trap /
-    fa-bglr.9 augment review, PR #55). Unknown/erroring instance -> ''."""
+    base would aim a cross-instance link at the wrong Vikunja and 404. Unknown/erroring instance -> ''."""
     cache: dict = {}
     def base(name) -> str:
         if name not in cache:
@@ -7883,9 +6990,8 @@ def _today_actions_impl(user_id: str = "", instance: str = "", now=None) -> dict
     actions (today-actions.md). PURE function of Vikunja state: no LLM, no side
     effects. `now` is injectable for tests.
 
-    `user_id` is accepted for the public contract (and Phase 5's MCP/multi-user
-    surface); data is currently scoped via `instance` and the ambient session
-    token, exactly like the sibling task_query primitives.
+    `user_id` is accepted for API compatibility and currently unused; data is scoped
+    via `instance`, exactly like the sibling task_query primitives.
 
     `now` defaults to the user's LOCAL time (per the instance timezone) so the
     "today" boundaries follow the user's day, not UTC.
@@ -7894,7 +7000,7 @@ def _today_actions_impl(user_id: str = "", instance: str = "", now=None) -> dict
         now = _today_now(instance)
     projects = _today_projects(instance)
     # Exclude BOTH Vikunja-archived AND triage-PARKED projects from today candidates.
-    # Park is meant to sweep a project out of the working surface (fa-k374), not merely
+    # Park is meant to sweep a project out of the working surface, not merely
     # tidy the Sort forest — so a parked project's tasks must stop surfacing here too.
     # `projects` keys are (key_inst, pid) with the same "default"/instance normalization
     # as _triage_parked's "inst:pid" strings, so the reconstructed key matches exactly.
@@ -7904,77 +7010,16 @@ def _today_actions_impl(user_id: str = "", instance: str = "", now=None) -> dict
     project_names = {key: info.get("title", "") for key, info in projects.items()}
     candidates = _gather_today_candidates(instance=instance, now=now, excluded=excluded)
     # Per-instance deep-link bases so each card's "open in Vikunja" link routes to the
-    # task's OWN instance, never the viewed one (fa-bglr.1 cross-instance trap).
+    # task's OWN instance, never the viewed one.
     _base = _instance_url_resolver()
     instance_urls = {c.get("instance"): _base(c.get("instance")) for c in candidates}
     clusters = _cluster_candidates(candidates, now, project_names, instance_urls)
     clustered = {(it.get("instance"), it["task_id"]) for c in clusters for it in c["items"]}
-    # Routine goals (fa-kx7l): unmet routines for the period, most urgent first, as
-    # their own cluster right after Must clear. They are NOT tasks: kind='routine',
-    # task_id='routine:<id>' (never collides with a Vikunja id), do = check in.
-    if user_id:
-        routine_cluster = _today_routine_cluster(user_id, now)
-        if routine_cluster:
-            pos = 1 if clusters and clusters[0].get("intent") == "must_clear" else 0
-            clusters.insert(pos, routine_cluster)
-    # today/10 (fa-odrk): who each account on screen can be handed to. Computed ONCE per
-    # account rather than once per card — every card from an account shares its
-    # visibility — and memoized, so the panel can decide whether to offer a "Send to…"
-    # at all instead of rendering a button that dead-ends on most tasks.
     return {
         "generated_at": now.isoformat(),
         "clusters": clusters,
         "counts": {"candidates": len(candidates), "clustered": len(clustered)},
     }
-
-
-def _today_handoff_cluster(items: list) -> Optional[dict]:
-    """The "Sent to you" cluster (today/10 D2) — pending offers, most recent first.
-
-    Composition, not re-scoring: an offer is not urgent, it is unanswered, so it carries a
-    fixed weight rather than competing on the scorer's terms. Hidden entirely when empty,
-    like `routine` — a "nothing was sent to you" row would be noise for everyone who is
-    not in a household."""
-    if not items:
-        return None
-    return {"intent": "handoff", "label": "Sent to you", "items": items}
-
-
-def _today_routine_cluster(user_id: str, now) -> Optional[dict]:
-    """The 'Routine' cluster for the today panel (composition, no re-scoring):
-    routines.today_cluster ranks unmet routines by urgency; this shapes them like
-    panel items. Never raises — the panel must render without routines.
-
-    Tagged PUBLIC_HELPER because _today_actions_impl (public) calls it; in the public
-    vikunja-mcp package the private `routines` module doesn't exist, so the import
-    fails inside the try and the cluster is simply absent — the intended degradation."""
-    try:
-        from .routines import today_cluster
-        today = now.date() if hasattr(now, "date") else now
-        items = today_cluster(user_id, today)
-    except Exception as e:
-        logger.warning(f"today: routine cluster unavailable for {user_id}: {e}")
-        return None
-    if not items:
-        return None
-    score_for = {"at_risk": 90, "due": 70, "ok": 45}
-    out = []
-    for r in items:
-        title = f"{r.get('emoji') or ''} {r['name']}".strip()
-        out.append({
-            "kind": "routine",
-            "routine_id": r["routine_id"],
-            "task_id": f"routine:{r['routine_id']}",
-            "title": title,
-            "score": score_for.get(r.get("urgency"), 45),
-            "why": r.get("why") or [],
-            "defer_count": 0,
-            "project": "Routine",
-            "context": None,
-            "instance": "",
-            "url": "",
-        })
-    return {"intent": "routine", "label": "Routine", "items": out}
 
 
 def _today_tz(instance: str = "") -> str:
@@ -7993,143 +7038,18 @@ def _today_now(instance: str = ""):
         return datetime.now(timezone.utc)
 
 
-def _today_claim_actor() -> str:
-    """Who a today-claim belongs to. MCP/kal/Slack/Matrix set `_current_user_id`; the
-    vikunja-native bot path carries the requester's username; a context-less owner or
-    CLI session claims as `__owner__` (one shared pool, exactly the old single-owner
-    label semantics — never another user's pool)."""
-    user_id = _current_user_id.get() or ""
-    if not user_id and _bot_mode.get():
-        requester = _requesting_user.get() or ""
-        if requester:
-            user_id = f"vikunja:{requester}"
-    return user_id or _OWNER_CLAIM_ACTOR
-
-
-def _account_key(instance: str = "") -> str:
-    """The account key chariot rows are filed under — the instance name as the actor
-    knows it ('default', 'household', …). ONE normalizer for every reader and writer
-    of every per-account table (today_claims, sweep_marks, special_label_cache), so
-    two code paths can never disagree on the key (today/08 defects B and C).
-
-    Under the per-user override an EMPTY instance means the user's own active account
-    (token_broker), never the owner's current instance — `_get_current_instance()`
-    reads the shared config and would file a user's rows under the owner's name
-    (auggie #2 LOW)."""
-    if instance:
-        return instance
-    if _per_user_override():
-        uid = _current_user_id.get() or ""
-        if uid:
-            try:
-                from .token_broker import get_user_active_instance
-                return get_user_active_instance(uid) or "default"
-            except Exception:  # noqa: BLE001
-                return "default"
-        return "default"
-    return _get_current_instance() or "default"
-
-
-def _today_claim_inst(instance: str = "") -> str:
-    """today_claims' account key — see `_account_key`."""
-    return _account_key(instance)
-
-
-def _backend_key(instance: str = "", *, create: bool = True) -> str:
-    """The BACKEND a chariot row is filed under — the Vikunja server, not the account
-    (today/09, fa-u0ci). ONE resolver, the way `_account_key` is one resolver for the
-    alias, so no two code paths can disagree.
-
-    `_account_key` normalizes the alias; this turns that alias into the server it points
-    at and mints an `fe_backends` row on first sight. The alias stays what it always was —
-    how THIS user selects a credential — but it is no longer part of any identity, which
-    is what stops a row filed under `default` from being invisible to a read scoped
-    `business` (today/09 §2.3).
-
-    `create` follows the store's read/write split: WRITE paths mint the backend on first
-    sight; READ and DELETE paths pass `create=False` so they neither write on a read nor
-    raise when the database is down. A backend that does not exist yet can have no rows
-    pointing at it, so "" is the correct answer for a read either way.
-
-    Returns "" when the account resolves to no usable URL. Every caller treats that as
-    "no chariot state available" and degrades, rather than filing rows under a key that
-    means nothing.
-
-    The same "" is returned when the chariot store itself is absent. `fe_tasks` is
-    server-side and is not published, so in the extracted single-user package this
-    import fails — and "no chariot state available" is exactly the right answer there,
-    not an error to propagate up through today_actions (fa-sxac).
-    """
-    try:
-        from . import fe_tasks
-    except ImportError:
-        return ""
-    try:
-        url, _token = _get_instance_config(_account_key(instance) or None)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("_backend_key: cannot resolve instance %r: %s", instance, e)
-        return ""
-    return fe_tasks.backend_id_for(url, create=create) or ""
-
-
-def _today_claim_ids(instance: str = "", now=None) -> set:
-    """Task ids the actor has claimed for their LOCAL today on `instance`. Empty set
-    when the store is unavailable (the read path degrades, never breaks)."""
-    try:
-        from . import today_claims
-    except Exception:
-        return set()
-    day = (now or _today_now(instance)).date()
-    try:
-        return today_claims.claimed_ids(_today_claim_actor(), _backend_key(instance, create=False), day)
-    except Exception as e:  # noqa: BLE001 — belt and braces: the panel must render
-        logger.warning(f"[today] claim read failed for {instance!r}: {e}")
-        return set()
-
-
-def _today_claimed_tasks(instance: str = "", now=None) -> list:
-    """Tasks the actor claimed for today (today/08 §4.4): the claim set from the
-    store, materialised against the instance's task list. Used to fold swiped-in
-    tasks into the candidate pool (#4) — a future-dated task the user explicitly
-    said "today" to, which the focused-query primitives miss. Empty when nothing is
-    claimed, so the (expensive) task fetch is skipped entirely.
-
-    Scoped to the given/ambient instance, like the engine (cross-instance today is
-    today/08 §6)."""
-    ids = _today_claim_ids(instance, now=now)
-    if not ids:
-        return []
-    inst = _today_claim_inst(instance)
-    result = _list_all_tasks_impl(include_meta=True, instance=inst, allow_truncated=True)
-    if not isinstance(result, dict) or "error" in result:
-        return []
-    return [t for t in result.get("tasks", []) if t.get("id") in ids]
-
-
-def _today_apply_impl(task_id: int, instance: str = "", source: str = "kal") -> dict:
-    """Swipe-right "do today": file a claim on the task for the actor's LOCAL today
-    (today/08 D3). Idempotent — claiming twice is the success state. Writes raise
-    (an apply that did not persist must not report success). No Vikunja write.
-
-    The claim store is server-side and unpublished, so in the extracted single-user
-    package this returns an explicit error rather than an ImportError traceback. It must
-    NOT return a success shape — the docstring's rule holds precisely here: a claim that
-    could not be filed has not been filed (fa-sxac)."""
-    try:
-        from . import today_claims
-    except ImportError:
-        return {"error": "claiming_unavailable",
-                "message": "Claiming a task for today needs the server-side claim store, "
-                           "which this build does not include."}
-    inst = _today_claim_inst(instance)
-    day = _today_now(instance).date()
-    today_claims.claim(_today_claim_actor(), _backend_key(instance), int(task_id), day, source=source)
-    return {"task_id": int(task_id), "instance": inst, "day": day.isoformat(), "today": True}
+def _today_apply_impl(task_id: int, instance: str = "", source: str = "") -> dict:
+    """Swipe-right "do today": claiming a task for today needs a claim store, which
+    this package does not include. Returns an explicit error rather than a success
+    shape — a claim that could not be filed has not been filed."""
+    return {"error": "claiming_unavailable",
+            "message": "Claiming a task for today needs a claim store, "
+                       "which this build does not include."}
 
 
 def _today_snooze_impl(task_id: int, reason: str = "", until: str = "",
                        wake_trigger: str = "", instance: str = "") -> dict:
-    """Not today — the reason-aware deferral (spec 07 §Behavior).
+    """Not today — the reason-aware deferral.
 
     A ``reason`` is REQUIRED. The legacy reasonless snooze-to-tomorrow (the
     canonical lie) has been retired now that both panels send a taxonomy reason —
@@ -8153,7 +7073,7 @@ def _today_snooze_impl(task_id: int, reason: str = "", until: str = "",
     if not reason:
         return {"error": "reason_required",
                 "valid": list(_DEFER_REASONS),
-                "message": "Deferral needs a reason (spec 07 taxonomy) — the legacy "
+                "message": "Deferral needs a reason — the legacy "
                            "snooze-to-tomorrow was retired. Pick one of `valid`; only "
                            "`dread` defers (and it needs a date)."}
 
@@ -8182,29 +7102,9 @@ def _today_snooze_impl(task_id: int, reason: str = "", until: str = "",
                            f"door closes ({door.date().isoformat()}). A one-way door "
                            f"can't be snoozed past."}
 
-    # read existing state; count/history are additive and survive completion.
-    # D4: the deferrals row is the fact; the description marker is the fallback (and
-    # stays written as a courtesy until the marker is retired).
-    row_state = None
-    try:
-        from . import deferrals
-        row_state = deferrals.get(_today_claim_actor(), _backend_key(instance or "", create=False), int(task_id))
-    except Exception:  # noqa: BLE001
-        row_state = None
-    marker_state = _extract_defer_meta(task.get("description"))
-    # Reconcile rather than trust the row blindly: a best-effort row write can fail
-    # after the marker landed, leaving the marker one step ahead (auggie #231 LOW).
-    # The richer record (higher count, then longer history) is the truth.
-    def _richness(st):
-        c = st.get("defer_count"); h = st.get("defer_history")
-        return (c if isinstance(c, int) and not isinstance(c, bool) else 0,
-                len(h) if isinstance(h, list) else 0)
-    if row_state is None:
-        state = marker_state
-    elif not marker_state:
-        state = row_state
-    else:
-        state = max((row_state, marker_state), key=_richness)
+    # read existing state from the description marker; count/history are additive and
+    # survive completion.
+    state = _extract_defer_meta(task.get("description"))
     count = state.get("defer_count")
     count = count if isinstance(count, int) and not isinstance(count, bool) and count > 0 else 0
     history = state.get("defer_history")
@@ -8238,18 +7138,10 @@ def _today_snooze_impl(task_id: int, reason: str = "", until: str = "",
     if new_desc and not _is_html(new_desc):
         new_desc = "<p></p>\n" + new_desc
     _update_task_impl(task_id, description=new_desc, instance=instance or None)
-    # D4: the row is the fact from here on. Best-effort — the marker write above
-    # already persisted the same state, so a store blip loses nothing.
-    try:
-        from . import deferrals
-        deferrals.upsert(_today_claim_actor(), _backend_key(instance or ""), int(task_id), new_state)
-    except Exception:  # noqa: BLE001
-        pass
-
     # `_is_deferred` keys on deferred_until, so a task only actually LEAVES today when a
     # date was set. A dateless blocked/wrong_context defer records the reason + wake
     # trigger but keeps surfacing until context-wake ships (D2) — report that honestly
-    # rather than claiming today=False (Augment #135).
+    # rather than claiming today=False.
     removed_from_today = until_dt is not None
     result = {"task_id": task_id, "instance": inst, "reason": reason,
               "defer_count": count, "today": not removed_from_today}
@@ -8264,14 +7156,6 @@ def _today_snooze_impl(task_id: int, reason: str = "", until: str = "",
         result["hint"] = "split"          # offer to split; the parent is NOT deferred
     elif reason == "not_mine":
         result["hint"] = "park_or_kill"    # delegated or dead — no deferral
-    # "Not today" after "today": withdraw today's claim so the fold-in (#4) stops
-    # overriding the snooze. Best-effort — the deferral itself already persisted.
-    try:
-        from . import today_claims
-        today_claims.unclaim(_today_claim_actor(), _backend_key(instance, create=False),
-                             int(task_id), _today_now(instance).date())
-    except Exception as e:  # noqa: BLE001
-        logger.warning(f"[today] unclaim after snooze failed for {task_id}: {e}")
     return result
 
 
@@ -8281,37 +7165,28 @@ def _today_delete_impl(task_id: int, instance: str = "") -> dict:
     deferred-delete + undo window client-side (the call only fires if the user
     doesn't undo). Invalidates BOTH the task-list and ICS caches (matching
     _delete_task_impl) so the deleted task stops rendering on the calendar grid
-    immediately, not after the ICS TTL (auggie M1)."""
+    immediately, not after the ICS TTL."""
     inst = instance or _get_current_instance()
     _request("DELETE", f"/api/v1/tasks/{task_id}", instance=instance or None)
     _invalidate_ics_cache(inst)
     _invalidate_task_list_cache()
-    # Chariot rows keyed on this task are now orphans — drop them (best-effort).
-    try:
-        from . import deferrals, occasions
-        deferrals.forget(_today_claim_actor(), _backend_key(instance or "", create=False), int(task_id))
-        occasions.forget(_today_claim_actor(), _backend_key(instance or "", create=False), int(task_id))
-    except Exception:  # noqa: BLE001
-        pass
     return {"task_id": task_id, "instance": inst, "deleted": True}
 
 
 def _today_reckoning_impl(instance: str = "", threshold: int = _RULE_OF_THREE) -> dict:
-    """Weekly reckoning (spec 07): surface ONLY the chronic deferrals — tasks pushed
+    """Weekly reckoning: surface ONLY the chronic deferrals — tasks pushed
     away `defer_count >= threshold` times — **not to do them, to KILL them.** A sibling
     of `triage_parked`: the hundreds of hidden tasks get audited here or nowhere.
     Read-only; returns the offenders sorted by defer_count (loudest first) with their
     reason, next return date, and history depth. `today_snooze` won't even show a
     "Not today" button on these (rule of three) — the reckoning is where they die."""
     # A reckoning is about DEFERRED tasks; threshold < 1 would sweep in every open task
-    # (undeferred tasks have defer_count 0), so floor it at 1 (Augment #135).
+    # (undeferred tasks have defer_count 0), so floor it at 1.
     threshold = max(1, int(threshold))
     res = _list_all_tasks_impl(include_meta=True, instance=instance, allow_truncated=True)
     tasks = res.get("tasks", []) if isinstance(res, dict) else []
-    dmap = _deferrals_map(instance)
     rows = []
     for t in tasks:
-        t = _overlay_deferral(t, dmap, instance)
         n = _defer_count(t)
         if n >= threshold:
             state = _task_defer_state(t)
@@ -8335,51 +7210,17 @@ def _today_reckoning_impl(instance: str = "", threshold: int = _RULE_OF_THREE) -
     }
 
 
-def _today_reset_impl(instance: str = "") -> dict:
-    """Manual "clear my today": withdraw every claim the actor filed for their LOCAL
-    today on `instance`. There is no scheduled reset any more — yesterday's claims
-    stop matching on their own (today/08 §4.4). Returns {instance, cleared}.
-
-    With no server-side claim store there is nothing to clear, and saying so beats an
-    ImportError. Reports zero rather than an error: clearing an empty set genuinely
-    succeeded (fa-sxac)."""
-    try:
-        from . import today_claims
-    except ImportError:
-        return {"instance": _today_claim_inst(instance), "cleared": 0}
-    inst = _today_claim_inst(instance)
-    day = _today_now(instance).date()
-    try:
-        cleared = today_claims.clear_day(_today_claim_actor(), _backend_key(instance, create=False), day)
-    except Exception as e:  # noqa: BLE001
-        return {"instance": inst, "cleared": 0, "error": str(e)}
-    return {"instance": inst, "cleared": cleared}
-
-
 def _set_today_action_weights(weights: dict) -> dict:
-    """Persist weight overrides for THIS ACTOR: the user's own `user_settings` row
-    (fa-amnt.7), or the global config for a system actor. Only known weight keys are
+    """Persist weight overrides to the config file. Only known weight keys are
     accepted; values are coerced to int; unknown keys are rejected (not silently
     stored). Returns ``{set, rejected, weights}`` where `weights` is the fully resolved
     set.
 
     Validation happens BEFORE anything is WRITTEN, so a call carrying one bad value
     can't leave half of it applied and an all-rejected call writes nothing."""
-    user_id, settings = _settings_actor()
-    per_user = bool(user_id)
-    if per_user and settings is None:
-        raise RuntimeError("user_settings unavailable — refusing to write weights into "
-                           "the shared config on behalf of a user")
-
-    # Validate FIRST: nothing is WRITTEN until every key has been checked, so a call
-    # carrying one bad value can't leave half of it applied, and a call carrying only
-    # bad keys writes nothing at all (augment review of #234).
-    #
-    # It can still SEED, and that is not a loophole: the response reports the resolved
-    # weights, which means a read, and any read performs the one-shot migration — the
-    # very next `today_get_weights` would do the same. The guarantee is "no partial
-    # write", not "no row may come into existence".
-    set_keys, rejected = {}, []
+    # Validate before anything is WRITTEN, so a call carrying one bad value can't leave
+    # half of it applied and an all-rejected call writes nothing.
+    rejected = []
     accepted = {}
     for key, value in (weights or {}).items():
         if key not in _TODAY_DEFAULT_WEIGHTS:
@@ -8392,20 +7233,11 @@ def _set_today_action_weights(weights: dict) -> dict:
     if not accepted:
         return {"set": {}, "rejected": rejected, "weights": _today_action_weights()}
 
-    if per_user:
-        # Seed (idempotent) so this partial update lands on top of the migrated values
-        # rather than replacing them.
-        _weight_overrides()
-        # Atomic shallow merge (`||`), not read-modify-write: two concurrent weight
-        # updates must not lose one another (augment review of #234).
-        settings.merge_object(user_id, settings.ALL_ACCOUNTS, settings.WEIGHTS, accepted)
-        set_keys = dict(accepted)
-    else:
-        cfg = _load_config() or {}
-        store = cfg.setdefault("today_actions", {}).setdefault("weights", {})
-        store.update(accepted)
-        set_keys = dict(accepted)
-        _save_config(cfg)
+    cfg = _load_config() or {}
+    store = cfg.setdefault("today_actions", {}).setdefault("weights", {})
+    store.update(accepted)
+    set_keys = dict(accepted)
+    _save_config(cfg)
     return {"set": set_keys, "rejected": rejected, "weights": _today_action_weights()}
 
 
@@ -8418,212 +7250,19 @@ def _triage_instances(instance: str = "") -> list:
     return list(instances.keys()) if instances else [None]
 
 
-def _settings_log():
-    """A logger resolved inline rather than via the module-level `logger`.
-
-    `_settings_module` is deliberately self-contained — it is the function that decides
-    whether this process even HAS the private store, so it must not lean on module
-    globals that the extracted public package doesn't carry (`logger` is already an
-    undefined name there 65 times over; see fa-ew4k). Keeping these two ERROR paths
-    self-sufficient costs nothing on a branch that only runs when an import failed.
-    """
-    return logging.getLogger(__name__)
-
-
-def _settings_module():
-    """The `user_settings` store, or None when it is unavailable.
-
-    The module being ABSENT is the expected case in the extracted public package: no
-    multi-user story there, so every per-user branch is dead code. Any OTHER import
-    failure is a broken private deploy and is logged at ERROR.
-
-    Either way callers get None — but None must NEVER be read as "use config.yaml" for
-    an authenticated user. For a real user that would silently reinstate the shared,
-    cross-user parked/weight state this table exists to remove (augment review of #234).
-    They degrade to the documented DEFAULTS instead: wrong-but-private beats
-    right-but-leaked, and writes raise rather than land in the shared file.
-
-    Resolved dynamically (like the contextvar in `_settings_actor`) so a static
-    reference can't become an undefined name in the public extract.
-    """
-    try:
-        from . import user_settings
-        return user_settings
-    except ModuleNotFoundError as e:
-        if (getattr(e, "name", "") or "").endswith("user_settings"):
-            return None          # the module itself is absent — the public package
-        _settings_log().error(
-            "user_settings unavailable (missing %s): per-user settings degrade to "
-            "DEFAULTS, never to the shared config", e.name, exc_info=True)
-        return None
-    except Exception:  # noqa: BLE001
-        _settings_log().error(
-            "user_settings failed to import: per-user settings degrade to DEFAULTS, "
-            "never to the shared config", exc_info=True)
-        return None
-
-
-def _settings_actor():
-    """``(user_id, store)`` — the one gate every reader and writer below goes through.
-
-    `user_id` alone decides WHERE state lives, and it is the tenancy boundary:
-      - empty  → a system actor (a sweep, the CLI, the legacy owner cookie). These read
-        and write `config.yaml`, so they keep seeing what they always saw. (Deliberately
-        NOT `_today_claim_actor`, which maps a context-less session onto the shared
-        `__owner__` pool: right for claims, wrong here.)
-      - set    → per-user rows, and `config.yaml` is now OFF LIMITS for this call no
-        matter what — including when `store` comes back None. See `_settings_module`.
-    """
-    holder = globals().get("_current_user_id")
-    user_id = (holder.get() if holder is not None else "") or ""
-    if not user_id:
-        return ("", None)
-    return (user_id, _settings_module())
-
-
-def _settings_is_config_owner(user_id: str) -> bool:
-    """True when `user_id` owns the config.yaml this process reads — the ONLY user
-    whose settings may be seeded from it (the file's parked keys are their projects).
-
-    The owner lookup is resolved through `globals()` rather than referenced directly:
-    it is @PRIVATE (per-user account management) and so is absent from the extracted
-    public package, where a static call would be an undefined name. Absent → False,
-    which is the right answer there anyway: no multi-user story, nothing to seed.
-    """
-    if not user_id:
-        return False
-    find_owner = globals().get("_find_calendar_owner_user_id")
-    if find_owner is None:
-        return False
-    try:
-        return find_owner() == user_id
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def _yaml_parked_accounts() -> set:
-    """Account names appearing in config.yaml's parked keys. An empty-instance read
-    walks EVERY configured account, so the seed has to cover all of them at once —
-    seeding only the active one leaves a legacy `household:512` unparked until that
-    account happens to be read by name (augment review of #234)."""
-    try:
-        raw = (_load_config().get("triage") or {}).get("parked") or []
-    except Exception:  # noqa: BLE001
-        return set()
-    out = set()
-    for entry in raw:
-        inst, sep, pid = str(entry).rpartition(":")
-        if sep and inst and pid.isdigit():
-            out.add(inst)
-    return out
-
-
-def _yaml_parked_ids(account: str) -> list:
-    """Project ids parked on `account` per config.yaml — the "inst:pid" strings filtered
-    to one account. Malformed entries are skipped, never guessed at."""
-    try:
-        raw = (_load_config().get("triage") or {}).get("parked") or []
-    except Exception:  # noqa: BLE001
-        return []
-    out = []
-    for entry in raw:
-        text = str(entry)
-        inst, _, pid = text.rpartition(":")
-        if inst == account and pid.isdigit():
-            out.append(int(pid))
-    return out
-
-
-def _settings_parked_ids(user_id: str, account: str) -> list:
-    """This user's parked project ids on `account`, seeding once from config.yaml.
-
-    A MISSING row (None) means "never seeded" and triggers the seed; a row holding an
-    empty list is a real answer ("I unparked everything") and must survive — which is
-    why the seed writes even when it has nothing to write.
-    """
-    _uid, store = _settings_actor()
-    if store is None:
-        # Only ever reached WITH a user (the system path returns before this), so the
-        # owner's file is not an option here — empty is the tenancy-safe degradation.
-        return []
-    try:
-        value = store.get(user_id, account, store.PARKED)
-        if value is None:
-            # No row = never seeded. Reached ONLY on a successful read, so a database
-            # outage can never be mistaken for a fresh user and re-serve config.yaml
-            # (augment review of #234).
-            value = _yaml_parked_ids(account) if _settings_is_config_owner(user_id) else []
-            store.seed_if_absent(user_id, account, store.PARKED, value)
-    except store.SettingsUnavailable:
-        return []      # store down: defaults, never the shared file
-    return [int(x) for x in (value or []) if str(x).isdigit() or isinstance(x, int)]
-
-
 def _triage_parked(instance: str = "") -> set:
-    """Set of parked project keys ("inst:pid"). Park is a durable, reversible flag —
-    not Vikunja archival — so revive is a clean toggle.
-
-    Per-user rows for a user actor (fa-amnt.7), the shared config for a system one.
-    The "inst:pid" RETURN shape is unchanged so every caller's key arithmetic
-    (`f"{key_inst}:{pid}" in parked`) keeps working untouched.
-    """
-    user_id, store = _settings_actor()
-    if not user_id:
-        cfg = _load_config()
-        raw = (cfg.get("triage") or {}).get("parked") or []
-        return set(str(x) for x in raw)
-    account = _account_key(instance)
-    if instance:
-        return {f"{account}:{pid}" for pid in _settings_parked_ids(user_id, account)}
-    # No account named, so the caller may walk SEVERAL (the owner-shaped forest, and
-    # the `triage_parked` tool's default). Seed every account this read could touch
-    # BEFORE unioning: `get_all_accounts` only returns rows that already exist, so
-    # seeding just the active one would omit legacy entries on the others until each
-    # was read by name (augment review of #234).
-    if store is None:
-        return set()                          # store down: nothing parked, nothing leaked
-    accounts = {account}
-    if _settings_is_config_owner(user_id):
-        accounts |= _yaml_parked_accounts()   # only the owner has legacy rows to bring over
-    for acct in accounts:
-        _settings_parked_ids(user_id, acct)
-    keys = set()
-    try:
-        rows = store.get_all_accounts(user_id, store.PARKED)
-    except store.SettingsUnavailable:
-        return set()   # store down: nothing parked, never the shared file
-    for other, value in rows.items():
-        if other:
-            keys |= {f"{other}:{pid}" for pid in (value or [])}
-    return keys
+    """Set of parked project keys ("inst:pid"), from the config file. Park is a durable,
+    reversible flag — not Vikunja archival — so revive is a clean toggle."""
+    cfg = _load_config()
+    raw = (cfg.get("triage") or {}).get("parked") or []
+    return set(str(x) for x in raw)
 
 
 def _triage_set_parked(project_id: int, instance: str = "", parked: bool = True) -> dict:
     """Add/remove a project from the parked set. `instance` empty → 'default', matching
-    the forest's empty-instance key so park never silently mismatches (auggie #9).
-
-    A user actor writes their own `user_settings` row (fa-amnt.7); a system actor keeps
-    writing config.yaml under the process lock. The returned `instance` is the key the
-    row was actually filed under, so the caller reports the same account the forest
-    will read it back on."""
-    user_id, store = _settings_actor()
-    if user_id:
-        if store is None:
-            raise RuntimeError("user_settings unavailable — refusing to park into the "
-                               "shared config on behalf of a user")
-        account = _account_key(instance)
-        # Seed FIRST (idempotent): a park on an account never read would otherwise
-        # create the row from this one id and lose the legacy config.yaml entries.
-        _settings_parked_ids(user_id, account)
-        # Then mutate in ONE statement. A read-modify-write here would let two rapid
-        # taps lose each other's update — the very race `_config_lock` was added for
-        # (auggie #8); a per-user row makes it rarer, not impossible, and a process
-        # lock wouldn't cover two web workers anyway (augment review of #234).
-        if parked:
-            store.list_add(user_id, account, store.PARKED, int(project_id))
-        else:
-            store.list_remove(user_id, account, store.PARKED, int(project_id))
-        return {"project_id": project_id, "instance": account, "parked": parked}
+    the forest's empty-instance key so park never silently mismatches. Writes the config
+    file under the process lock. The returned `instance` is the key the entry was filed
+    under, so the caller reports the same account the forest will read it back on."""
     inst_key = instance or "default"
     key = f"{inst_key}:{project_id}"
     with _config_lock:
@@ -8653,20 +7292,18 @@ def _triage_due_state(task: dict, now_utc) -> str:
     return "overdue" if d < now_utc else "future"
 
 
-def _triage_task_state(task: dict, now, now_utc, today_ids=frozenset()):
+def _triage_task_state(task: dict, now, now_utc):
     """Triage load class of a task: 'overdue' | 'undated', or None when it already has a
-    home — done, claimed for today (committed), snoozed (future start_date), or
-    future-dated. This is what makes someday/today actually CLEAR the pile (auggie #3):
+    home — done, snoozed (future start_date), or
+    future-dated. This is what makes someday/today actually CLEAR the pile:
     a deferred or committed task stops counting as load and leaves the assignment queue.
-    `today_ids` is the actor's claim set for the task's instance (today/08 D3)."""
+"""
     if task.get("done"):
-        return None
-    if today_ids and task.get("id") in today_ids:
         return None
     if _is_snoozed(task, now):
         return None
-    # today/08 §2: an Occasion is never load (it rolls), and a passed Event is a
-    # decision card (D6) or nothing — neither belongs in the overdue pile.
+    # An Occasion is never load (it rolls), and a passed Event is a
+    # decision card or nothing — neither belongs in the overdue pile.
     kind = _task_kind(task)
     if kind == "occasion" or (kind == "event" and _event_passed(task, now)):
         return None
@@ -8690,15 +7327,11 @@ def _triage_counts(inst_list: list, now) -> tuple:
             continue
         truncated = truncated or bool(res.get("truncated"))
         key_inst = inst if inst is not None else "default"
-        # No `now=` here on purpose: the forest spans instances, and a claim is stamped
-        # with ITS instance's local day by the writer — so look it up the same way
-        # (auggie #228 LOW: one ambient `now` misreads a claim near midnight across tz).
-        today_ids = _today_claim_ids(inst or "")
         for t in res.get("tasks", []):
             pid = t.get("project_id")
             if pid is None:
                 continue
-            st = _triage_task_state(t, now, now_utc, today_ids)
+            st = _triage_task_state(t, now, now_utc)
             if st is None:
                 continue
             counts.setdefault((key_inst, pid), {"overdue": 0, "undated": 0})[st] += 1
@@ -8707,7 +7340,7 @@ def _triage_counts(inst_list: list, now) -> tuple:
 
 def _list_projects_complete(instance=None, per_page: int = 50, max_pages: int = 20) -> tuple:
     """``(projects, complete)`` — the instance's projects, and whether that list is
-    provably ALL of them (fa-tpoo, augment review of #235).
+    provably ALL of them.
 
     `_list_projects_impl` is fine for rendering but must never be used to conclude a
     project does not EXIST: `_fetch_all_pages` defaults to `raise_on_error=False`, so a
@@ -8734,8 +7367,7 @@ def _list_projects_complete(instance=None, per_page: int = 50, max_pages: int = 
 
 
 def _triage_reconcile_parked(parked: set, fetched: dict) -> tuple:
-    """Split stored parked keys against the projects the forest actually fetched
-    (fa-tpoo). PURE. Returns ``(archived_parked, orphans)``:
+    """Split stored parked keys against the projects the forest actually fetched. PURE. Returns ``(archived_parked, orphans)``:
 
       archived_parked  [{id, title, instance}] — the project exists but is archived, so
                        it has no node and `prune_parked` can't list it. Without this it
@@ -8746,7 +7378,7 @@ def _triage_reconcile_parked(parked: set, fetched: dict) -> tuple:
     An instance is only judged for ORPHANS when its entry is marked ``complete`` — a
     provably exhaustive project list. Two ways to fail that, and both would destroy real
     state: the fetch raised (instance absent from `fetched` entirely), or it came back
-    silently truncated (`_list_projects_complete`, augment #235). Reading "I couldn't
+    silently truncated. Reading "I couldn't
     see it" as "it does not exist" is the same shape of mistake as treating a store
     outage as a fresh user (review of #234).
 
@@ -8768,36 +7400,10 @@ def _triage_reconcile_parked(parked: set, fetched: dict) -> tuple:
         elif pid not in seen["ids"] and seen.get("complete"):
             # ABSENCE only means "deleted" against a provably complete list. A truncated
             # or partially-failed page walk omits live projects, and reaping on that
-            # would destroy real parked state (augment #235). Presence is still
+            # would destroy real parked state. Presence is still
             # trustworthy either way, which is why archived surfacing needs no such gate.
             orphans.append((inst, pid))
     return archived_parked, orphans
-
-
-def _triage_reap_orphan_parks(orphans: list) -> None:
-    """Drop park keys whose project no longer exists, for a per-user actor (fa-tpoo).
-
-    Lazy on read, like the other chariot backfills. Best-effort and silent on failure —
-    reaping a tombstone is housekeeping, and it must never break the forest that just
-    rendered correctly without it.
-
-    Only the per-user store is reaped. The system actor's `config.yaml` is left alone on
-    purpose: writing the shared file from a READ path is what made the original
-    per-user-state mess hard to reason about, and that path is being retired anyway.
-    """
-    if not orphans:
-        return
-    user_id, store = _settings_actor()
-    if not user_id or store is None:
-        return
-    for inst, pid in orphans:
-        try:
-            store.list_remove(user_id, inst, store.PARKED, pid)
-        except Exception as e:  # noqa: BLE001
-            # Same self-contained logger as the settings gate: this runs on the read
-            # path of a function the public extract carries, where `logger` is undefined.
-            _settings_log().warning(
-                "triage: could not reap orphan park %s:%s — %s", inst, pid, e)
 
 
 def _triage_forest_impl(instance: str = "", now=None) -> dict:
@@ -8813,7 +7419,7 @@ def _triage_forest_impl(instance: str = "", now=None) -> dict:
 
     nodes: dict = {}
     # What each instance's projects fetch actually returned, for reconciling the stored
-    # parked set below (fa-tpoo). An instance is recorded ONLY on a successful fetch —
+    # parked set below. An instance is recorded ONLY on a successful fetch —
     # the `except: continue` below is a transient outage, and treating "I couldn't ask"
     # as "the project is gone" would reap a user's whole parked set on one bad request.
     fetched: dict = {}
@@ -8833,7 +7439,7 @@ def _triage_forest_impl(instance: str = "", now=None) -> dict:
             if p.get("is_archived"):
                 # Archived projects get no node — but a parked one still has to be
                 # REACHABLE, or it is swept aside with no Revive button anywhere
-                # (fa-tpoo). Keep the title so it can be listed under `parked`.
+                # Keep the title so it can be listed under `parked`.
                 seen["archived"][pid] = p.get("title", "")
                 continue
             c = counts.get((key_inst, pid), {})
@@ -8845,7 +7451,7 @@ def _triage_forest_impl(instance: str = "", now=None) -> dict:
                 "parked": f"{key_inst}:{pid}" in parked, "children": [],
             }
 
-    # Build an ACYCLIC forest (auggie #4). Index children by parent, then attach via DFS
+    # Build an ACYCLIC forest. Index children by parent, then attach via DFS
     # from the roots with a visited guard: a back-edge to an already-visited node is NOT
     # linked, so a self-parent or cycle is broken in the OUTPUT (not just in traversal —
     # a cyclic child structure would crash JSON serialization). Pure-cycle islands
@@ -8896,16 +7502,14 @@ def _triage_forest_impl(instance: str = "", now=None) -> dict:
                 kept.append(c)
         return kept
     tree = prune_parked(roots)
-    # Reconcile the STORED parked set against what the fetch actually saw (fa-tpoo).
-    # Archived-but-parked projects have no node, so `prune_parked` above can never list
-    # them — add them here or they are invisible AND unrevivable. Orphans (no project at
-    # all) are reaped from the store.
-    archived_parked, orphans = _triage_reconcile_parked(parked, fetched)
+    # Reconcile the STORED parked set against what the fetch actually saw. Archived-but-
+    # parked projects have no node, so `prune_parked` above can never list them — add
+    # them here or they are invisible AND unrevivable.
+    archived_parked, _orphans = _triage_reconcile_parked(parked, fetched)
     parked_list.extend(archived_parked)
-    _triage_reap_orphan_parks(orphans)
     # Deterministic `parked` order (grouped by instance, then title) — prune harvests in
     # traversal order, which isn't otherwise sorted; a stable order keeps the "swept aside"
-    # list from reshuffling between fetches (augment #131).
+    # list from reshuffling between fetches.
     parked_list.sort(key=lambda p: (str(p["instance"]), p["title"].lower(), p["id"]))
 
     def rollup(n):
@@ -8938,7 +7542,7 @@ def _triage_forest_impl(instance: str = "", now=None) -> dict:
 
 def _triage_parked_list_impl(instance: str = "") -> dict:
     """The parked ("swept aside") projects — the Sort-tab state that's otherwise
-    invisible outside the calendar UI (fa-hfg6). Reuses the forest's own `parked`
+    invisible outside the calendar UI. Reuses the forest's own `parked`
     sectioning so it stays consistent with what Sort shows. Lets the conversation
     (Claude Desktop / in-app chat) see what's set aside to reason about or revive it.
     Returns {parked: [{id, title, instance}], count}."""
@@ -8970,7 +7574,7 @@ def _triage_park_impl(project_id: int, parked: bool = True, instance: str = "",
     goes through `_fetch_all_pages`, whose `raise_on_error` defaults to False — an outage or a
     failed later page comes back as an empty/partial list, which is indistinguishable from
     "no such project". That would report `project_not_found` for a project that exists and
-    refuse a legitimate park during an outage (augment review, PR #196). A single GET raises
+    refuse a legitimate park during an outage. A single GET raises
     instead, so the two cases stay separable.
     """
     inst = instance or _get_current_instance() or ""
@@ -8999,8 +7603,7 @@ def _triage_park_impl(project_id: int, parked: bool = True, instance: str = "",
 
 
 def _assign_preview_text(raw: str, cap: int = 500) -> str:
-    """Plain-text snippet of a task description for the inspect-before-act preview
-    (fa-bglr.9) — so the user can EXAMINE a task (often a 'task' that's really a note)
+    """Plain-text snippet of a task description for the inspect-before-act preview — so the user can EXAMINE a task (often a 'task' that's really a note)
     before assigning or deleting it. Strips HTML (script/style content too), unescapes
     entities, collapses whitespace, caps length."""
     if not raw:
@@ -9008,7 +7611,7 @@ def _assign_preview_text(raw: str, cap: int = 500) -> str:
     import html as _htmlmod
     # Unescape FIRST so encoded markup (&lt;b&gt;…) becomes real tags and gets stripped
     # too — otherwise it would resurface as visible "<b>" text in the plain-text snippet
-    # (augment review, PR #55). Order: decode → drop script/style w/ content → tags → ws.
+    # Order: decode → drop script/style w/ content → tags → ws.
     s = _htmlmod.unescape(raw)
     s = re.sub(r'<(script|style)[^>]*>.*?</\1>', '', s, flags=re.IGNORECASE | re.DOTALL)
     s = re.sub(r'<\s*br\s*/?>', ' ', s, flags=re.IGNORECASE)
@@ -9025,20 +7628,19 @@ def _assign_queue_impl(project_id: int, instance: str = "", now=None) -> dict:
         now = _today_now(instance)
     now_utc = now.astimezone(timezone.utc)
     res = _list_all_tasks_impl(include_meta=True, instance=instance or None, allow_truncated=True)
-    # Deep-link base (fa-bglr.9 / fa-bglr.1): resolve PER ITEM-INSTANCE, not once — the
+    # Deep-link base: resolve PER ITEM-INSTANCE, not once — the
     # queue can span instances when `instance` is empty (two instances may share a
     # project id), so a single base_url would point some items at the wrong Vikunja
-    # frontend (augment review, PR #55). Shared memoized resolver. {url}/tasks/{id}.
+    # frontend. Shared memoized resolver. {url}/tasks/{id}.
     _inst_base = _instance_url_resolver()
     items = []
     truncated = False
     if isinstance(res, dict):
         truncated = bool(res.get("truncated"))
-        today_ids = _today_claim_ids(instance, now=now)
         for t in res.get("tasks", []):
             if t.get("project_id") != int(project_id):
                 continue
-            st = _triage_task_state(t, now, now_utc, today_ids)
+            st = _triage_task_state(t, now, now_utc)
             if st is None:
                 continue  # done / today / snoozed / future-dated = already has a home
             tid = t.get("id")
@@ -9049,7 +7651,7 @@ def _assign_queue_impl(project_id: int, instance: str = "", now=None) -> dict:
                 "priority": t.get("priority", 0) or 0,
                 "instance": item_inst,
                 "overdue": st == "overdue", "undated": st == "undated",
-                # inspect-before-act (fa-bglr.9): deep-link + a preview of what this is
+                # inspect-before-act: deep-link + a preview of what this is
                 "url": _vikunja_task_url(base_url, tid),
                 "description": _assign_preview_text(t.get("description", "")),
                 "labels": [l.get("title", "") for l in (t.get("labels") or []) if l.get("title")],
@@ -9068,9 +7670,8 @@ def _assign_verify_deletable(task_id: int, instance: str = "", now=None):
     now_utc = now.astimezone(timezone.utc)
     res = _list_all_tasks_impl(include_meta=True, instance=instance or None, allow_truncated=True)
     tid = str(task_id)
-    today_ids = _today_claim_ids(instance, now=now)
     for t in (res.get("tasks", []) if isinstance(res, dict) else []):
-        if str(t.get("id")) == tid and _triage_task_state(t, now, now_utc, today_ids) is not None:
+        if str(t.get("id")) == tid and _triage_task_state(t, now, now_utc) is not None:
             return t
     return None
 
@@ -9116,8 +7717,7 @@ def _assign_apply_guarded(task_id, disposition: str, instance: str = "", now=Non
 
     Both `/calendar-api/assign` (POST) and the `assign_apply` MCP tool route through here,
     so the irreversible-delete hardening cannot drift between the two surfaces. That drift
-    is not hypothetical: it is why park and assign were UI-only in the first place
-    (`fa-bg5x`, `fa-yj5n`) — the guards lived inline in the HTTP handler with nothing
+    is not hypothetical: it is why park and assign were UI-only in the first place — the guards lived inline in the HTTP handler with nothing
     shared, so an MCP layer could only be written by copying them or by going without.
 
     Division of labor. **Transport auth stays with the caller** — session validation,
@@ -9127,7 +7727,7 @@ def _assign_apply_guarded(task_id, disposition: str, instance: str = "", now=Non
       - the disposition must be one of `ASSIGN_DISPOSITIONS`;
       - `delete` is irreversible, so it must bind to a genuinely-surfaced actionable task
         (`_assign_verify_deletable`) and take its instance from **that verified task**,
-        never from a caller-supplied value (auggie #1).
+        never from a caller-supplied value.
 
     Raises `AssignRefused`; returns the disposition result otherwise.
     """
@@ -9166,12 +7766,12 @@ def today_actions(
 @mcp_tool_with_fallback
 def today_snooze(
     task_id: int = Field(description="ID of the task to defer out of today"),
-    reason: str = Field(description="Deferral reason (spec 07 taxonomy), REQUIRED (no default): 'dread' (the only true deferral — needs a date), 'blocked', 'too_big', 'wrong_context', 'not_mine'. A deferral must name why — the legacy snooze-to-tomorrow was retired."),
+    reason: str = Field(description="Deferral reason, REQUIRED (no default): 'dread' (the only true deferral — needs a date), 'blocked', 'too_big', 'wrong_context', 'not_mine'. A deferral must name why — the legacy snooze-to-tomorrow was retired."),
     until: str = Field(default="", description="Date to defer until, e.g. '2026-07-22'. MANDATORY for reason='dread'. Rejected if on/after the task's door_closes."),
     wake_trigger: str = Field(default="", description="Context to wake on for 'blocked'/'wrong_context' defers, e.g. '@laptop'."),
     instance: str = Field(default="", description="Vikunja instance name. Empty = current instance.")
 ) -> dict:
-    """"Not today" — reason-aware deferral (spec 07). With a `reason` it records the
+    """"Not today" — reason-aware deferral. With a `reason` it records the
     taxonomy, increments defer_count only for `dread` (which requires a date), rejects
     deferrals past a `door_closes`, appends to defer_history, and flags `rule_of_three`
     on the 3rd dread defer. Deferred tasks ESCALATE on return, never sink. A `reason`
@@ -9187,9 +7787,7 @@ def today_set_weights(
     weights: dict = Field(description="Map of weight overrides, e.g. {\"W_OVERDUE\": 15, \"W_GOAL\": 12}. Keys: W_OVERDUE, W_DUE_TODAY, W_PRIORITY, W_STALE, W_GOAL, W_TIMEBLOCK, W_QUICK, W_DOOR, W_DEFER. Unknown keys are rejected.")
 ) -> dict:
     """Re-tune today-actions scoring at runtime (no code change). Persists the
-    overrides for YOU — a connected user's weights are their own (`user_settings`,
-    today/08 §5.2); only a context-less system/CLI call writes the shared config.
-    Every later deterministic run for that same actor honors them. Returns the keys
+    overrides to the config file. Every later deterministic run honors them. Returns the keys
     set, any rejected, and the fully resolved weight set."""
     return _set_today_action_weights(weights)
 
@@ -9198,7 +7796,7 @@ def today_set_weights(
 @mcp_tool_with_fallback
 def today_get_weights() -> dict:
     """Show the current today-actions scoring weights: the documented defaults overlaid
-    with YOUR saved overrides (per-user; a system/CLI call sees the shared config's)."""
+    with any saved overrides from the config file."""
     return {"weights": _today_action_weights(), "defaults": dict(_TODAY_DEFAULT_WEIGHTS)}
 
 
@@ -9236,8 +7834,8 @@ def triage_park(
 ) -> dict:
     """PARK a whole project — "read the desk, don't organize it": sweep a speculative
     tree aside in one gesture so the work that matters can speak. The counterpart to
-    triage_parked (which only lists). Park is a durable, REVERSIBLE flag stored for
-    YOU (`user_settings`, today/08 §5.2; a system/CLI call writes the shared config) —
+    triage_parked (which only lists). Park is a durable, REVERSIBLE flag stored in
+    the config file —
     it never touches Vikunja, never deletes a task, and never marks anything done;
     pass parked=False to revive. Use it on inert trees (all-undated, never-touched
     batches), not on individual tasks. Returns {project_id, instance, parked, title}."""
@@ -9407,253 +8005,6 @@ def ctx_set(
         "available_instances": list(instances.keys()),
         "hint": "Use ctx_set to change defaults, or pass instance= to individual tools."
     }
-
-
-def _build_share_button_blocks(response_text: str) -> list:
-    """Build Slack blocks for ephemeral response (private to user).
-
-    Used for channel @mentions to protect privacy - response shown only to user.
-    Share button disabled until Slack Interactivity is configured (solutions-pm0v).
-    """
-    blocks = [
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": response_text
-            }
-        },
-        {
-            "type": "context",
-            "elements": [
-                {
-                    "type": "mrkdwn",
-                    "text": ":lock: _Only visible to you_"
-                }
-            ]
-        }
-    ]
-    return blocks
-
-
-def _format_tasks_for_slack(result: dict, title: str) -> str:
-    """Format task list result as Slack mrkdwn."""
-    if "error" in result:
-        return f":warning: Error: {result['error']}"
-
-    tasks = result.get("tasks", [])
-    if not tasks:
-        return f":white_check_mark: {title}: No tasks found"
-
-    lines = [f"*{title}* ({len(tasks)} tasks):\n"]
-    for task in tasks[:20]:  # Limit to 20 for readability
-        priority = task.get("priority", 0)
-        priority_emoji = {5: ":rotating_light:", 4: ":red_circle:", 3: ":large_orange_circle:", 2: ":large_yellow_circle:"}.get(priority, "")
-        instance = task.get("instance", "")
-        instance_tag = f" [{instance}]" if instance and len(_get_instances()) > 1 else ""
-        due = task.get("due_date", "")[:10] if task.get("due_date") else ""
-        due_str = f" (due {due})" if due else ""
-        lines.append(f"{priority_emoji} {task.get('title', 'Untitled')}{instance_tag}{due_str}")
-
-    if len(tasks) > 20:
-        lines.append(f"\n_...and {len(tasks) - 20} more_")
-
-    # Add instance summary if multi-instance
-    by_instance = result.get("by_instance", {})
-    if len(by_instance) > 1:
-        instance_summary = ", ".join(f"{name}: {count}" for name, count in by_instance.items())
-        lines.append(f"\n_Instances: {instance_summary}_")
-
-    return "\n".join(lines)
-
-
-def _format_summary_for_slack(result: dict) -> str:
-    """Format task summary as Slack mrkdwn."""
-    if "error" in result:
-        return f":warning: Error: {result['error']}"
-
-    total = result.get("total", 0)
-    overdue = result.get("overdue", 0)
-    due_today = result.get("due_today", 0)
-    due_this_week = result.get("due_this_week", 0)
-    critical = result.get("critical", 0)
-    urgent = result.get("urgent", 0)
-    high_priority = result.get("high_priority", 0)
-    unscheduled = result.get("unscheduled", 0)
-
-    lines = [f"*Task Summary* ({total} total)\n"]
-
-    # Time-based
-    if overdue:
-        lines.append(f":warning: Overdue: {overdue}")
-    if due_today:
-        lines.append(f":calendar: Due today: {due_today}")
-    if due_this_week:
-        lines.append(f":date: Due this week: {due_this_week}")
-
-    # Priority-based
-    if critical:
-        lines.append(f":rotating_light: Critical (P5): {critical}")
-    if urgent:
-        lines.append(f":red_circle: Urgent (P4+): {urgent}")
-    if high_priority:
-        lines.append(f":large_orange_circle: High priority (P3+): {high_priority}")
-
-    # Other
-    if unscheduled:
-        lines.append(f":grey_question: Unscheduled: {unscheduled}")
-
-    # Instance breakdown
-    by_instance = result.get("by_instance", {})
-    if len(by_instance) > 1:
-        instance_summary = ", ".join(f"{name}: {count}" for name, count in by_instance.items())
-        lines.append(f"\n_Instances: {instance_summary}_")
-
-    return "\n".join(lines)
-
-
-def _format_instances_for_slack() -> str:
-    """Format instance list for /instances slash command."""
-    instances = _get_instances()
-    current = _get_current_instance()
-
-    if not instances:
-        return ":x: No Vikunja instances configured."
-
-    lines = [f"*Configured Instances* ({len(instances)}):\n"]
-    for name, config in instances.items():
-        url = config.get("url", "")
-        is_current = " ← current" if name == current else ""
-        lines.append(f"• *{name}*: {url}{is_current}")
-
-    return "\n".join(lines)
-
-
-def _format_help_for_slack(topic: str = "") -> str:
-    """Format help message for /help slash command."""
-    topic = topic.strip().lower()
-
-    # Detailed help for specific commands
-    command_help = {
-        "overdue": (
-            "*`/overdue`* - Tasks past their due date\n\n"
-            "Shows all incomplete tasks where due date < now.\n"
-            "Sorted by due date (oldest first), then priority."
-        ),
-        "today": (
-            "*`/today`* - Tasks due today + overdue\n\n"
-            "Shows tasks due today AND any overdue tasks.\n"
-            "Best for daily planning - what needs attention NOW."
-        ),
-        "week": (
-            "*`/week`* - Tasks due this week\n\n"
-            "Shows tasks due in the next 7 days + overdue.\n"
-            "Good for weekly planning and sprint reviews."
-        ),
-        "priority": (
-            "*`/priority`* - High priority tasks (3+)\n\n"
-            "Shows tasks with priority 3, 4, or 5.\n"
-            "Vikunja priority scale: 0=none, 1-2=low, 3=medium, 4=high, 5=urgent"
-        ),
-        "urgent": (
-            "*`/urgent`* - Urgent tasks (priority 4+)\n\n"
-            "Shows only priority 4 and 5 tasks.\n"
-            "For critical items that need immediate attention."
-        ),
-        "unscheduled": (
-            "*`/unscheduled`* - Tasks without due date\n\n"
-            "Shows tasks with no due date set.\n"
-            "Useful for backlog review and scheduling floating tasks."
-        ),
-        "focus": (
-            "*`/focus`* - What to work on now\n\n"
-            "Shows: high priority (3+) OR due today/overdue.\n"
-            "Combines urgency and importance for actionable view."
-        ),
-        "summary": (
-            "*`/summary`* - Quick task counts\n\n"
-            "Shows counts: overdue, due today, due this week, priority levels.\n"
-            "Fastest overview - no task details, just numbers."
-        ),
-        "connections": (
-            "*`/connections`* - Show connected Vikunja instances\n\n"
-            "Lists all your Vikunja connections with URLs.\n"
-            "All task commands query ALL connections in parallel."
-        ),
-        "project": (
-            "*`/project`* - Set active project context\n\n"
-            "*Usage:*\n"
-            "• `/project` - Show current active project\n"
-            "• `/project Kitchen` - Set active project (fuzzy match)\n"
-            "• `/project Kitchen 2` - Select 2nd match if ambiguous\n"
-            "• `/clear` - Clear active project\n\n"
-            "_When set, slash commands show only tasks from that project._"
-        ),
-        "connect": (
-            "*`/connect`* - Connect a Vikunja instance\n\n"
-            "*Usage:* `/connect <name> <url> <token>`\n\n"
-            "*Example:*\n"
-            "`/connect personal vikunja.example.com abc123...`\n\n"
-            "*Get your token:*\n"
-            "1. Log into your Vikunja instance\n"
-            "2. Go to Settings > API Tokens\n"
-            "3. Create a new token and copy it here\n\n"
-            "_Response is always private - your token is never shown._"
-        ),
-        "disconnect": (
-            "*`/disconnect`* - Remove a Vikunja instance\n\n"
-            "*Usage:* `/disconnect <name>`\n\n"
-            "*Example:* `/disconnect personal`\n\n"
-            "_Use `/connections` to see available instances._"
-        ),
-        "usage": (
-            "*`/usage`* - Toggle usage/ECO footer\n\n"
-            "*Usage:*\n"
-            "• `/usage` - Toggle footer on/off\n"
-            "• `/usage on` - Show footer\n"
-            "• `/usage off` - Hide footer\n\n"
-            "_The footer shows your ECO streak (consecutive slash commands)\n"
-            "and estimated token savings vs LLM queries._"
-        ),
-    }
-
-    if topic and topic in command_help:
-        return command_help[topic]
-
-    if topic:
-        return f":warning: Unknown command: `{topic}`\n\nType `/help` for all commands."
-
-    # General help
-    instances = _get_instances()
-    instance_note = f" across {len(instances)} instances" if len(instances) > 1 else ""
-
-    return f"""*Factum Erit Commands*{instance_note}
-
-*Task Filters* (no LLM cost, instant):
-• `/overdue` - Tasks past due date
-• `/today` - Due today + overdue
-• `/week` - Due within 7 days
-• `/priority` - Priority 3+ tasks
-• `/urgent` - Priority 4+ (critical only)
-• `/unscheduled` - No due date set
-• `/focus` - High priority OR due today
-• `/summary` - Quick counts only (fastest)
-
-*Context*:
-• `/project [name]` - Set active project for filtering
-• `/clear` - Clear active project
-• `/connections` - Show connected Vikunja instances
-
-*Setup* (always private):
-• `/connect <name> <url> <token>` - Add Vikunja instance
-• `/disconnect <name>` - Remove instance
-• `/usage [on|off]` - Toggle ECO footer
-
-• `/help [command]` - Help for specific command
-
-*Chat*: Message me naturally for complex queries!
-_"What's overdue in the Kitchen project?"_
-_"Create a task to buy groceries, due tomorrow"_"""
 
 
 @mcp.tool()
@@ -9891,102 +8242,8 @@ def _invalidate_project_colors_cache():
     _project_colors_cache = {}
 
 
-@mcp.custom_route("/move/{task_id}/{project_id}/{token}", methods=["GET"])
-async def move_task_to_project(request: Request):
-    """Move a task to a different project and redirect to Vikunja.
-
-    URL: /move/{task_id}/{project_id}/{token}
-
-    - task_id: The task ID to move
-    - project_id: The target project ID
-    - token: Security token derived from task_id + project_id + bot_token
-
-    On success: Moves the task and redirects to the task in Vikunja.
-    On error: Returns JSON error message.
-    """
-    from starlette.responses import RedirectResponse
-
-    task_id_str = request.path_params.get("task_id", "")
-    project_id_str = request.path_params.get("project_id", "")
-    url_token = request.path_params.get("token", "")
-
-    # Validate task_id and project_id
-    try:
-        task_id = int(task_id_str)
-        project_id = int(project_id_str)
-    except (ValueError, TypeError):
-        return JSONResponse(
-            {"error": "invalid_ids", "message": "Task ID and Project ID must be numbers"},
-            status_code=400
-        )
-
-    # Validate token
-    bot_token = os.environ.get("VIKUNJA_BOT_TOKEN", "")
-    expected_token = hashlib.sha256(f"{task_id}:{project_id}:{bot_token}".encode()).hexdigest()[:12]
-    # Constant-time compare — move token rides in the URL path (sea-ywwu).
-    if not url_token or not hmac.compare_digest(url_token, expected_token):
-        return JSONResponse(
-            {"error": "invalid_token", "message": "Invalid or expired move token"},
-            status_code=401
-        )
-
-    # Move the task
-    from .vikunja_client import BotVikunjaClient, VikunjaAPIError
-
-    try:
-        client = BotVikunjaClient()
-
-        # Get current task
-        task = client.get_task(task_id)
-        if not task:
-            return JSONResponse(
-                {"error": "task_not_found", "message": f"Task #{task_id} not found"},
-                status_code=404
-            )
-
-        # Clean description: remove "Move to:" links after successful move
-        description = task.get("description", "")
-        if description and "📁" in description:
-            import re
-            # Remove the move links section (📁 Move to: ...)
-            # Pattern: ---\n📁 **Move to:** ... to end of that line
-            description = re.sub(r'\n*---\n*📁 \*?\*?Move to:\*?\*?[^\n]*\n*', '', description)
-            # Also remove standalone move links without ---
-            description = re.sub(r'\n*📁 \*?\*?Move to:\*?\*?[^\n]*\n*', '', description)
-            description = description.rstrip()
-
-        # Update task with new project_id and cleaned description
-        task["project_id"] = project_id
-        client.update_task(task_id, project_id=project_id, description=description)
-
-        logger.info(f"Moved task #{task_id} to project #{project_id}")
-
-    except VikunjaAPIError as e:
-        return JSONResponse(
-            {"error": "move_failed", "message": f"Could not move task: {e}"},
-            status_code=500
-        )
-
-    # Redirect to the task in Vikunja
-    vikunja_url = os.environ.get("VIKUNJA_URL", "https://vikunja.factumerit.app")
-    redirect_url = f"{vikunja_url}/tasks/{task_id}"
-
-    return RedirectResponse(url=redirect_url, status_code=302)
-
-
 # ---------------------------------------------------------------------------
-# Public entry point.
-#
-# Appended verbatim to the generated package by scripts/extract_public.py. It is
-# NOT extracted from server.py, because the private main() is not a stdio entry
-# point that happens to carry extras — it is a Factumerit server boot: it grants
-# roles from ADMIN_USER_IDS, applies Alembic revisions against DATABASE_URL,
-# re-seals Google refresh tokens, mounts OAuth middleware and the @eis poller.
-# None of that belongs in a package someone installs to talk to their own
-# Vikunja, and every piece of it reaches for a name the extraction does not
-# publish.
-#
-# So the public package gets its own main: parse a transport, run the server.
+# Entry point: parse a transport, run the server.
 # ---------------------------------------------------------------------------
 
 
