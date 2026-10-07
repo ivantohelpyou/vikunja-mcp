@@ -1627,7 +1627,7 @@ def _import_all_projects_impl(export_data: dict, dry_run: bool = False) -> dict:
                                     (new_project_id, new_view_id, new_bid, old_tid)
                                 )
                         except Exception as e:
-                            summary["errors"].append(f"Bucket '{bucket['title']}': {e}")
+                            summary["errors"].append(f"Bucket '{bucket.get('title')}': {e}")
 
                     # Switch to manual mode and set default/done buckets so tasks
                     # render as cards rather than column headers (v2.0+ requirement). The done
@@ -3458,14 +3458,14 @@ def _column_specs(configs: list) -> list[dict]:
 
     Vikunja reads position 0 as "unset" and parks the column at id * 65536, after every column
     numbered by hand. Numbering from 0 (0, 1000, 2000...) put the first column last. So every
-    column gets a nonzero position: its own if it has one, else (index + 1) * 1000.
+    column gets a nonzero position: its own if it has one, else after the highest one given,
+    at highest + (index + 1) * 1000, which is still last, where Vikunja would have put it.
+    A missing title is passed on as None, for the caller's per-column error handling.
     """
-    specs = []
-    for i, c in enumerate(configs or []):
-        c = {"title": c} if isinstance(c, str) else dict(c)
-        specs.append({"title": c["title"], "position": c.get("position") or (i + 1) * 1000,
-                      "limit": c.get("limit", 0)})
-    return specs
+    configs = [{"title": c} if isinstance(c, str) else dict(c) for c in configs or []]
+    top = max((c.get("position") or 0 for c in configs), default=0)
+    return [{"title": c.get("title"), "position": c.get("position") or top + (i + 1) * 1000,
+             "limit": c.get("limit", 0)} for i, c in enumerate(configs)]
 
 
 def _create_bucket_impl(project_id: int, view_id: int, title: str, position: int = 0, limit: int = 0) -> dict:

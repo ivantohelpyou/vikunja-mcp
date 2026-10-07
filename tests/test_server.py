@@ -789,3 +789,29 @@ class TestColumnOrder:
         kanban = [(t, bid) for ep, t, bid in fake_vikunja.buckets if t in ("A", "B")][:2]
         assert sorted(kanban, key=lambda x: fake_vikunja.position[x[1]])[0][0] == "A"
 
+    def test_import_keeps_a_zero_position_column_last(self, fake_vikunja):
+        from vikunja_mcp import server
+        data = _board_export()
+        kanban = next(v for v in data["projects"][0]["views"] if v["view_kind"] == "kanban")
+        kanban["buckets"] = [{"id": 31, "title": "A", "position": 65536, "task_ids": [1]},
+                             {"id": 32, "title": "B", "position": 0, "task_ids": [2]},
+                             {"id": 33, "title": "C", "position": 196608, "task_ids": []}]
+        server._import_all_projects_impl(data)
+        made = [(t, bid) for ep, t, bid in fake_vikunja.buckets if t in ("A", "B", "C")][:3]
+        assert [t for t, bid in sorted(made, key=lambda x: fake_vikunja.position[x[1]])] == ["A", "C", "B"]
+
+    def test_import_reports_a_titleless_column_and_carries_on(self, fake_vikunja, monkeypatch):
+        from vikunja_mcp import server
+        real = fake_vikunja.request
+        def strict(method, endpoint, **kw):   # Vikunja refuses a bucket with no title
+            if method == "PUT" and endpoint.endswith("/buckets") and not (kw.get("json") or {}).get("title"):
+                raise ValueError("400 Bad Request")
+            return real(method, endpoint, **kw)
+        monkeypatch.setattr(server, "_request", strict)
+        data = _board_export()
+        kanban = next(v for v in data["projects"][0]["views"] if v["view_kind"] == "kanban")
+        kanban["buckets"].insert(0, {"id": 30, "task_ids": []})
+        summary = server._import_all_projects_impl(data)
+        assert any("Bucket 'None'" in e for e in summary["errors"])
+        assert {"A", "B"} <= {t for _, t, _ in fake_vikunja.buckets}
+
