@@ -861,6 +861,11 @@ class TestDescriptionHtml:
         out = _description_html("Run:\n```\nls\n- a\n```\ndone")
         assert "<pre><code>" in out and "- a" in out and "<li>" not in out and "<p>done</p>" in out
 
+    def test_only_the_opening_marker_closes_a_fence(self):
+        from vikunja_mcp.server import _description_html
+        out = _description_html("~~~\n```\n- a\n~~~\nz")
+        assert "<li>" not in out and "```\n- a" in out
+
     def test_windows_line_endings(self):
         from vikunja_mcp.server import _description_html
         out = _description_html("Produce:\r\n- onions\r\n- leeks\r\nDone")

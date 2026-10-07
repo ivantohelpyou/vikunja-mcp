@@ -379,15 +379,17 @@ def md_to_html(text: str) -> str:
     # If already HTML, don't convert
     if _is_html(text):
         return text
-    lines, prev, in_list, in_fence = [], "", False, False
+    lines, prev, in_list, fence = [], "", False, ""
     for line in text.replace("\r\n", "\n").split("\n"):
-        if _FENCE.match(line):
-            if not in_fence and prev.strip():
+        m = _FENCE.match(line)
+        if m and (not fence or m.group(1) == fence):   # only the opening marker closes a fence
+            if not fence and prev.strip():
                 lines.append("")   # a fence after text needs a blank line too
-            in_fence, in_list = not in_fence, False
+            fence, in_list = ("" if fence else m.group(1)), False
             lines.append(line)
             prev = line
             continue
+        in_fence = bool(fence)
         if in_fence:   # code: leave it exactly as written
             lines.append(line)
             prev = line
