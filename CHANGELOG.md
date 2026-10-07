@@ -8,6 +8,15 @@ source it was generated from.
 
 **This release renames every tool.** If you are on 0.9.3, read §Migration.
 
+### Fixed — `kanban_setup` keeps custom columns in the order given
+
+Found in a clean-machine setup test (2026-10-07). On 0.9.3, custom columns were numbered from
+0; Vikunja reads position 0 as unset and puts that column after the others, so the first
+column ("5 min") came out last. The 0.10.0 source instead took only `{title, position}` dicts
+and crashed on a plain list of titles. `custom_buckets` now takes titles or dicts, and a column
+with no position of its own gets (index + 1) × 1000. `project_import` uses the same rule for
+columns exported without a position.
+
 ### Fixed — `project_import` brings a board back as it was
 
 Found pushing a board between two instances (2026-10-06). Each of these lost data

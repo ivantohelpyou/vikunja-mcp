@@ -580,6 +580,7 @@ class FakeVikunja:
         self.views = {}   # project id -> [view dicts]
         self.done = {}    # task id -> done
         self.buckets = [] # (endpoint, title, new id), in the order made
+        self.position = {}  # bucket id -> position, Vikunja's rule: 0 means id * 65536
         self.fail_view_posts = False
 
     def nid(self):
@@ -617,7 +618,8 @@ class FakeVikunja:
         if parts[-1] == "buckets" and method == "PUT":
             bid = self.nid()
             self.buckets.append((endpoint, body["title"], bid))
-            return {"id": bid, **body}
+            self.position[bid] = body.get("position") or bid * 65536
+            return {"id": bid, **body, "position": self.position[bid]}
         if parts[:1] == ["projects"] and parts[-1] == "tasks" and method == "PUT":
             tid = self.nid()
             self.done[tid] = body.get("done", False)
@@ -740,3 +742,50 @@ class TestImportFidelity:
         sent = [b["filter"]["filter"] for m, e, b in fake_vikunja.calls if "/views" in e and b.get("filter")]
         assert "labels in 0 && done = false" in sent
         assert any("[99]" in e for e in out["errors"])
+
+
+# ============================================================================
+# Kanban column order. Found in the PDD setup test (2026-10-07): custom columns numbered from 0,
+# and Vikunja reads 0 as unset, so the first column ("5 min") landed after the last ("Transit").
+# ============================================================================
+
+
+class TestColumnOrder:
+    def _order(self, fake):
+        return [t for _, t, bid in sorted(fake.buckets, key=lambda b: fake.position[b[2]])]
+
+    def _project(self, fake):
+        return fake.request("PUT", "/api/v1/projects", json={"title": "Saturday night"})["id"]
+
+    def test_custom_titles_keep_their_order(self, fake_vikunja):
+        from vikunja_mcp import server
+        pid = self._project(fake_vikunja)
+        server._setup_kanban_board_impl(project_id=pid, template="custom",
+                                        custom_buckets=["5 min", "10 min", "15 min", "Transit"])
+        assert self._order(fake_vikunja) == ["5 min", "10 min", "15 min", "Transit"]
+
+    def test_custom_dicts_without_positions_keep_their_order(self, fake_vikunja):
+        from vikunja_mcp import server
+        pid = self._project(fake_vikunja)
+        server._setup_kanban_board_impl(project_id=pid, template="custom",
+                                        custom_buckets=[{"title": "Now"}, {"title": "Next", "limit": 3}, {"title": "Later"}])
+        assert self._order(fake_vikunja) == ["Now", "Next", "Later"]
+        assert [b["limit"] for _, _, b in fake_vikunja.calls if b.get("title") == "Next"] == [3]
+
+    def test_explicit_positions_win(self, fake_vikunja):
+        from vikunja_mcp import server
+        pid = self._project(fake_vikunja)
+        server._setup_kanban_board_impl(project_id=pid, template="custom",
+                                        custom_buckets=[{"title": "B", "position": 20}, {"title": "A", "position": 10}])
+        assert self._order(fake_vikunja) == ["A", "B"]
+
+    def test_import_of_columns_without_positions_keeps_their_order(self, fake_vikunja):
+        from vikunja_mcp import server
+        data = _board_export()
+        for v in data["projects"][0]["views"]:
+            for b in v.get("buckets") or []:
+                b.pop("position", None)
+        server._import_all_projects_impl(data)
+        kanban = [(t, bid) for ep, t, bid in fake_vikunja.buckets if t in ("A", "B")][:2]
+        assert sorted(kanban, key=lambda x: fake_vikunja.position[x[1]])[0][0] == "A"
+

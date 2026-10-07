@@ -1613,13 +1613,9 @@ def _import_all_projects_impl(export_data: dict, dry_run: bool = False) -> dict:
                         pass
 
                     new_bucket_ids = []
-                    for bucket in view.get("buckets", []):
+                    for bucket, spec in zip(view.get("buckets", []), _column_specs(view.get("buckets", []))):
                         try:
-                            new_bucket = _request("PUT", f"/api/v1/projects/{new_project_id}/views/{new_view_id}/buckets", json={
-                                "title": bucket["title"],
-                                "position": bucket.get("position", 0),
-                                "limit": bucket.get("limit", 0),
-                            })
+                            new_bucket = _request("PUT", f"/api/v1/projects/{new_project_id}/views/{new_view_id}/buckets", json=spec)
                             new_bid = new_bucket["id"]
                             bucket_id_map[bucket["id"]] = new_bid
                             new_bucket_ids.append(new_bid)
@@ -3457,6 +3453,21 @@ def _list_buckets_impl(project_id: int, view_id: int) -> list[dict]:
     return [_format_bucket(b) for b in response]
 
 
+def _column_specs(configs: list) -> list[dict]:
+    """Kanban columns as {title, position, limit}, in the order given; each a title or a dict.
+
+    Vikunja reads position 0 as "unset" and parks the column at id * 65536, after every column
+    numbered by hand. Numbering from 0 (0, 1000, 2000...) put the first column last. So every
+    column gets a nonzero position: its own if it has one, else (index + 1) * 1000.
+    """
+    specs = []
+    for i, c in enumerate(configs or []):
+        c = {"title": c} if isinstance(c, str) else dict(c)
+        specs.append({"title": c["title"], "position": c.get("position") or (i + 1) * 1000,
+                      "limit": c.get("limit", 0)})
+    return specs
+
+
 def _create_bucket_impl(project_id: int, view_id: int, title: str, position: int = 0, limit: int = 0) -> dict:
     data = {"title": title, "position": position, "limit": limit}
     response = _request("PUT", f"/api/v1/projects/{project_id}/views/{view_id}/buckets", json=data)
@@ -3622,12 +3633,7 @@ def _setup_kanban_board_impl(
 
     # 4. Create template buckets
     created_buckets = []
-    for config in buckets_config:
-        bucket_data = {
-            "title": config["title"],
-            "position": config.get("position", 0),
-            "limit": config.get("limit", 0)
-        }
+    for bucket_data in _column_specs(buckets_config):
         bucket = _request("PUT", f"/api/v1/projects/{project_id}/views/{view_id}/buckets", json=bucket_data)
         created_buckets.append({
             "id": bucket["id"],
@@ -4355,7 +4361,7 @@ def kanban_setup(
     project_id: int = Field(default=None, description="ID of existing project (or use project_title to create new)"),
     project_title: str = Field(default=None, description="Create new project with this title (alternative to project_id)"),
     template: str = Field(default="gtd", description="Template: gtd, sprint, kitchen, payables, talks, or custom"),
-    custom_buckets: list = Field(default=None, description="For template='custom': list of {title, position, limit?}"),
+    custom_buckets: list = Field(default=None, description="For template='custom': column titles in order, or {title, position?, limit?} dicts"),
     view_title: str = Field(default="Kanban", description="Name for the kanban view"),
     delete_default_buckets: bool = Field(default=True, description="Delete auto-created Backlog/Done buckets"),
     migrate_tasks: dict = Field(default=None, description="Map label titles to bucket titles for task migration")
