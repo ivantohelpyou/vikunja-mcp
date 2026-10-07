@@ -580,6 +580,7 @@ class FakeVikunja:
         self.views = {}   # project id -> [view dicts]
         self.done = {}    # task id -> done
         self.buckets = [] # (endpoint, title, new id), in the order made
+        self.fail_view_posts = False
 
     def nid(self):
         self.next += 1
@@ -604,7 +605,13 @@ class FakeVikunja:
             self.views[int(parts[1])].append(v)
             return v
         if parts[:1] == ["projects"] and len(parts) == 4 and parts[2] == "views" and method == "POST":
+            if self.fail_view_posts and "bucket_configuration_mode" not in body:
+                raise ValueError("400 Bad Request")
             return {"id": int(parts[3]), **body}
+        if parts[:1] == ["projects"] and len(parts) == 4 and parts[2] == "views" and method == "DELETE":
+            pid, vid = int(parts[1]), int(parts[3])
+            self.views[pid] = [v for v in self.views[pid] if v["id"] != vid]
+            return {}
         if parts[-1] == "buckets" and method == "GET":
             return []
         if parts[-1] == "buckets" and method == "PUT":
@@ -690,7 +697,7 @@ class TestImportFidelity:
         _import_all_projects_impl(_board_export())
         views = next(iter(fake_vikunja.views.values()))
         titles = sorted(v["title"] for v in views)
-        assert titles == ["Gantt", "Kanban", "Keep", "List", "Table"]   # one each; Keep added
+        assert titles == ["Kanban", "Keep", "List"]   # one each, Keep added, unused defaults gone
 
     def test_remap_filter_labels(self):
         from vikunja_mcp.server import _remap_filter_labels
@@ -699,4 +706,37 @@ class TestImportFidelity:
         assert _remap_filter_labels("labels in 26, 27", m) == "labels in 501, 502"
         assert _remap_filter_labels("labels != 27", m) == "labels != 502"
         assert _remap_filter_labels("done = false", m) == "done = false"
-        assert _remap_filter_labels("labels in 99", m) == "labels in 99"   # unknown: left as is
+        missing = []
+        assert _remap_filter_labels("labels in 99", m, missing) == "labels in 0"   # unknown: matches nothing
+        assert missing == [99]
+
+    def test_a_reused_default_view_loses_its_own_filter_when_the_source_had_none(self, fake_vikunja):
+        from vikunja_mcp.server import _import_all_projects_impl
+        data = _board_export()
+        del data["projects"][0]["views"][0]["filter"]   # the source's List shows done tasks too
+        _import_all_projects_impl(data)
+        list_post = next(b for m, e, b in fake_vikunja.calls if m == "POST" and b.get("title") == "List")
+        assert list_post["filter"] == {"filter": ""}
+
+    def test_a_failed_takeover_creates_the_view_instead(self, fake_vikunja):
+        from vikunja_mcp.server import _import_all_projects_impl
+        fake_vikunja.fail_view_posts = True
+        out = _import_all_projects_impl(_board_export())
+        titles = sorted(v["title"] for v in next(iter(fake_vikunja.views.values())))
+        assert titles == ["Kanban", "Keep", "List"]   # each made once, the refused defaults gone
+        assert any("reusing the default failed" in e for e in out["errors"])
+
+    def test_default_views_the_source_did_not_have_are_removed(self, fake_vikunja):
+        from vikunja_mcp.server import _import_all_projects_impl
+        _import_all_projects_impl(_board_export())   # the source has List, Kanban, Keep: no Gantt, no Table
+        titles = sorted(v["title"] for v in next(iter(fake_vikunja.views.values())))
+        assert titles == ["Kanban", "Keep", "List"]
+
+    def test_an_unknown_label_in_a_filter_matches_nothing_and_is_reported(self, fake_vikunja):
+        from vikunja_mcp.server import _import_all_projects_impl
+        data = _board_export()
+        data["projects"][0]["views"][2]["filter"] = "labels in 99 && done = false"
+        out = _import_all_projects_impl(data)
+        sent = [b["filter"]["filter"] for m, e, b in fake_vikunja.calls if "/views" in e and b.get("filter")]
+        assert "labels in 0 && done = false" in sent
+        assert any("[99]" in e for e in out["errors"])

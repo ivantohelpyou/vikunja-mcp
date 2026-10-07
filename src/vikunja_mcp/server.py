@@ -1456,12 +1456,21 @@ def _topological_sort_projects(projects: list[dict]) -> list[dict]:
 _LABEL_FILTER = re.compile(r"(\blabels\s*(?:not\s+in|in|!=|=)\s*)([0-9][0-9,\s]*)", re.I)
 
 
-def _remap_filter_labels(filt: str, label_id_map: dict) -> str:
+def _remap_filter_labels(filt: str, label_id_map: dict, missing: Optional[list] = None) -> str:
     """A view filter names labels by id ("labels in 26 && done = false"); on another instance
-    those ids are other labels or none. Rewrite each to the imported label's id."""
+    those ids are other labels or none. Rewrite each to the imported label's id. An id the
+    export has no label for becomes 0 (matches nothing) and is reported in `missing`: left
+    as is, it would silently match whatever label has that id on the target."""
     def swap(m):
         ids = [x.strip() for x in m.group(2).split(",") if x.strip()]
-        new = [str(label_id_map.get(int(x), x)) for x in ids]
+        new = []
+        for x in ids:
+            if int(x) in label_id_map:
+                new.append(str(label_id_map[int(x)]))
+            else:
+                new.append("0")
+                if missing is not None:
+                    missing.append(int(x))
         trail = " " if m.group(2).endswith(" ") else ""
         return m.group(1) + ", ".join(new) + trail
     return _LABEL_FILTER.sub(swap, filt or "")
@@ -1564,18 +1573,32 @@ def _import_all_projects_impl(export_data: dict, dry_run: bool = False) -> dict:
                     "title": view["title"],
                     "view_kind": view.get("view_kind", "list"),
                 }
+                reuse = auto_views.pop((view["title"], view.get("view_kind", "list")), None)
                 if view.get("filter"):
                     filt = view["filter"]
                     if isinstance(filt, dict):
                         filt = filt.get("filter", "")
                     # Vikunja 2.x takes the filter as an object; a plain string is refused (400),
                     # which lost every filtered view. Label ids in it are the source's: remap.
-                    view_payload["filter"] = {"filter": _remap_filter_labels(filt, label_id_map)}
-                reuse = auto_views.pop((view["title"], view.get("view_kind", "list")), None)
+                    missing: list = []
+                    view_payload["filter"] = {"filter": _remap_filter_labels(filt, label_id_map, missing)}
+                    if missing:
+                        summary["errors"].append(
+                            f"View '{view['title']}' in '{project['title']}': its filter names labels "
+                            f"{missing} that the export has no label for; they now match nothing")
+                elif reuse:
+                    # no filter in the source: clear the default view's own (a default List hides
+                    # done tasks; the source's did not)
+                    view_payload["filter"] = {"filter": ""}
+                new_view = None
                 if reuse:
-                    new_view = _request("POST", f"/api/v1/projects/{new_project_id}/views/{reuse['id']}",
-                                        json={**reuse, **view_payload})
-                else:
+                    try:
+                        new_view = _request("POST", f"/api/v1/projects/{new_project_id}/views/{reuse['id']}",
+                                            json={**reuse, **view_payload})
+                    except Exception as e:   # taking the default over failed: create it instead
+                        summary["errors"].append(f"View '{view['title']}': reusing the default failed ({e}); created")
+                        auto_views[(view["title"], view.get("view_kind", "list"))] = reuse
+                if new_view is None:
                     new_view = _request("PUT", f"/api/v1/projects/{new_project_id}/views", json=view_payload)
                 new_view_id = new_view["id"]
                 summary["views_created"] += 1
@@ -1639,6 +1662,15 @@ def _import_all_projects_impl(export_data: dict, dry_run: bool = False) -> dict:
                             pass
             except Exception as e:
                 summary["errors"].append(f"View '{view.get('title')}' in '{project['title']}': {e}")
+
+        # Default views the source did not have (it deleted its Gantt, say) go too, so the copy
+        # has the source's views and no others. Only when the export listed views at all.
+        if project.get("views"):
+            for leftover in auto_views.values():
+                try:
+                    _request("DELETE", f"/api/v1/projects/{new_project_id}/views/{leftover['id']}")
+                except Exception:
+                    pass
 
         # ── Step 4: Tasks ─────────────────────────────────────────────────────
         for task in project.get("tasks", []):
