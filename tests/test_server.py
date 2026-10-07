@@ -821,3 +821,62 @@ class TestColumnOrder:
         assert [s["title"] for s in specs] == ["A", "B", "C"]
         assert specs[0]["position"] == "5" and specs[1]["position"] == 7000 + 2000
 
+
+
+# ============================================================================
+# Descriptions are HTML in Vikunja. Found in the PDD setup test on the NUC (2026-10-07, fa-t339):
+# an agent's plain-line descriptions showed as one run-on paragraph.
+# ============================================================================
+
+
+class TestDescriptionHtml:
+    def test_plain_lines_stay_lines(self):
+        from vikunja_mcp.server import _description_html
+        out = _description_html("Shop at Pike Place\nButcher for the ribs\nAbout 1 hr")
+        assert out.count("<br") == 2 and "Butcher for the ribs" in out
+
+    def test_a_list_right_after_a_line_is_a_list(self):
+        from vikunja_mcp.server import _description_html
+        out = _description_html("Produce:\n- 4 sweet potatoes\n- 2 onions\nDairy: none")
+        assert "<ul>" in out and out.count("<li>") == 2 and "Produce:" in out
+
+    def test_a_line_after_a_list_is_not_part_of_it(self):
+        from vikunja_mcp.server import _description_html
+        out = _description_html("Produce:\n- 1 lb mushrooms\n- 2 onions\nAbout half a day")
+        assert "2 onions</li>" in out and "<p>About half a day</p>" in out
+
+    def test_a_line_after_an_indented_continuation_leaves_the_list(self):
+        from vikunja_mcp.server import _description_html
+        out = _description_html("Serve with:\n1. rice\n2. slaw\n   (make ahead)\nDone.")
+        assert "<ol>" in out and "(make ahead)</li>" in out and "<p>Done.</p>" in out
+
+    def test_html_passes_through_untouched(self):
+        from vikunja_mcp.server import _description_html
+        html = "<p>Starter: <a href='https://en.wikibooks.org/wiki/Cookbook:Hummus'>Hummus</a></p>"
+        assert _description_html(html) == html
+
+    def test_html_inside_plain_text_is_escaped(self):
+        from vikunja_mcp.server import _description_html
+        out = _description_html("note <script>alert(1)</script>\nsecond line")
+        assert "<script>" not in out and "&lt;script&gt;" in out
+
+    def test_every_write_path_converts(self, monkeypatch):
+        from vikunja_mcp import server
+        calls = []
+        def record(method, endpoint, **kw):   # just enough of an object for the formatters
+            calls.append((method, endpoint, kw.get("json") or {}))
+            return {"id": 1, "title": "t", "project_id": 1, "task_id": 1, "done": False, "labels": [],
+                    "description": "", "comment": "", "author": {"username": "u"}}
+        monkeypatch.setattr(server, "_request", record)
+        pid = 1
+        server._create_project_impl("P", description="a\nb")
+        server._create_task_impl(pid, "T", description="a\nb")
+        server._update_project_impl(pid, description="a\nb")
+        server._update_task_impl(7, description="a\nb")
+        server._batch_update_tasks_impl([{"task_id": 8, "description": "a\nb"}])
+        server._add_comment_impl(7, "a\nb")
+        server._update_comment_impl(7, 1, "a\nb")
+        sent = [b.get("description") or b.get("comment") for m, ep, b in calls
+                if m in ("PUT", "POST") and (b.get("description") or b.get("comment"))]
+        assert len(sent) == 7, sent
+        assert all("<br" in d for d in sent), sent

@@ -352,17 +352,43 @@ def _is_html(text: str) -> bool:
     return stripped.lower().startswith(html_starts)
 
 
+_LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+
+
 def md_to_html(text: str) -> str:
     """Convert markdown to HTML for Vikunja descriptions.
 
-    If text is already HTML, returns it unchanged.
+    If text is already HTML, returns it unchanged. Vikunja shows descriptions as HTML, and
+    agents write plain lines: so a single line break stays a line break (nl2br), a list
+    straight after a line of text ("Produce:" then "- 4 onions") is still a list, and a line
+    after the list stays out of its last item. Plain Markdown would merge all of it.
     """
     if not text:
         return text
     # If already HTML, don't convert
     if _is_html(text):
         return text
-    return markdown.markdown(text)
+    lines, prev, in_list = [], "", False
+    for line in text.split("\n"):
+        item, indented = bool(_LIST_ITEM.match(line)), line.startswith((" ", "\t"))
+        # A blank line before a list, and after one: else the next line joins its last item.
+        if prev.strip() and ((item and not in_list) or (in_list and line.strip() and not item and not indented)):
+            lines.append("")
+        if item:
+            in_list = True
+        elif line.strip() and not indented:
+            in_list = False
+        lines.append(line)
+        prev = line
+    return markdown.markdown("\n".join(lines), extensions=["nl2br", "sane_lists"])
+
+
+def _description_html(text: str) -> str:
+    """Any description or comment, as Vikunja stores it: HTML passes through; anything
+    else is escaped (no HTML injection through Markdown) and converted."""
+    if not text or _is_html(text):
+        return text
+    return md_to_html(_sanitize_description(text))
 
 
 def _sanitize_title(title: str) -> str:
@@ -1223,7 +1249,7 @@ def _create_project_impl(title: str, description: str = "", hex_color: str = "",
     # Security: Sanitize title (strip HTML)
     data = {"title": _sanitize_title(title)}
     if description:
-        data["description"] = description
+        data["description"] = _description_html(description)
     if hex_color:
         data["hex_color"] = hex_color
     if parent_project_id:
@@ -1315,7 +1341,7 @@ def _update_project_impl(project_id: int, title: str = "", description: str = ""
     if title:
         current["title"] = _sanitize_title(title)
     if description:
-        current["description"] = description
+        current["description"] = _description_html(description)
     if hex_color:
         current["hex_color"] = hex_color
     if parent_project_id >= 0:  # -1 means don't change, 0 means root, >0 means reparent
@@ -1839,7 +1865,7 @@ def project_get(
 @mcp_tool_with_fallback
 def project_create(
     title: str = Field(description="Title of the new project"),
-    description: str = Field(default="", description="Optional project description"),
+    description: str = Field(default="", description="Optional project description. Markdown or HTML. Vikunja stores HTML: plain lines are kept as lines, '- ' lines become a list"),
     hex_color: str = Field(default="", description="Color in hex format (e.g., '#3498db')"),
     parent_project_id: int = Field(default=0, description="Parent project ID for nesting (0 = top-level)")
 ) -> dict:
@@ -1871,7 +1897,7 @@ def project_delete(
 def project_update(
     project_id: int = Field(description="ID of the project to update"),
     title: str = Field(default="", description="New title (empty = keep current)"),
-    description: str = Field(default="", description="New description (empty = keep current)"),
+    description: str = Field(default="", description="New description (empty = keep current). Markdown or HTML. Vikunja stores HTML: plain lines are kept as lines, '- ' lines become a list"),
     hex_color: str = Field(default="", description="New color in hex format (empty = keep current)"),
     parent_project_id: int = Field(default=-1, description="New parent project ID (-1 = keep current, 0 = move to root, >0 = reparent under that project)"),
     position: float = Field(default=-1, description="Position for ordering (-1 = keep current, lower = earlier in list)")
@@ -2034,11 +2060,7 @@ def _create_task_impl(project_id: int, title: str, description: str = "", start_
     warnings = []
 
     if description:
-        # If already HTML, pass through; otherwise sanitize and convert markdown
-        if _is_html(description):
-            data["description"] = description
-        else:
-            data["description"] = md_to_html(_sanitize_description(description))
+        data["description"] = _description_html(description)
     if start_date:
         start_date, warn = _validate_and_fix_date(start_date, "start_date")
         data["start_date"] = start_date
@@ -2081,11 +2103,7 @@ def _update_task_impl(task_id: int, title: str = "", description: str = "", star
     if title:
         current["title"] = _sanitize_title(title)
     if description:
-        # If already HTML, pass through; otherwise sanitize and convert markdown
-        if _is_html(description):
-            current["description"] = description
-        else:
-            current["description"] = md_to_html(_sanitize_description(description))
+        current["description"] = _description_html(description)
     if start_date:
         start_date, warn = _validate_and_fix_date(start_date, "start_date")
         current["start_date"] = start_date
@@ -2447,7 +2465,7 @@ def _resolve_instance_for_project(project_id: int, instance: Optional[str]) -> O
 def task_create(
     project_id: int = Field(description="ID of the project to create the task in"),
     title: str = Field(description="Title of the task"),
-    description: str = Field(default="", description="Optional task description"),
+    description: str = Field(default="", description="Optional task description. Markdown or HTML. Vikunja stores HTML: plain lines are kept as lines, '- ' lines become a list"),
     start_date: str = Field(default="", description="Event start time (ISO format) - sets DTSTART in calendar feed (Google Cal/Outlook)"),
     end_date: str = Field(default="", description="Event end time (ISO format) - sets DTEND in calendar feed (Google Cal/Outlook)"),
     due_date: str = Field(default="", description="Due date in ISO format - for deadlines/Upcoming view"),
@@ -2619,7 +2637,7 @@ def cal_add_event(
     project_id: int = Field(description="ID of the project to create the task in"),
     title: str = Field(description="Title of the calendar event"),
     due_date: str = Field(description="Due date/time in ISO format (YYYY-MM-DDTHH:MM:SSZ)"),
-    description: str = Field(default="", description="Optional event description"),
+    description: str = Field(default="", description="Optional event description. Markdown or HTML. Vikunja stores HTML: plain lines are kept as lines, '- ' lines become a list"),
     start_date: str = Field(default="", description="Event start time (ISO format) - sets DTSTART; defaults to due_date if omitted"),
     end_date: str = Field(default="", description="Event end time (ISO format) - sets DTEND; defaults to due_date+1hr if omitted"),
     label_name: str = Field(default="calendar", description="Label name to add (default: 'calendar')")
@@ -2721,7 +2739,7 @@ def _read_anno_md(description: str = "", fallback_due: str = "") -> Optional[str
 def task_update(
     task_id: int = Field(description="ID of the task to update"),
     title: str = Field(default="", description="New title (empty = keep current)"),
-    description: str = Field(default="", description="New description (empty = keep current)"),
+    description: str = Field(default="", description="New description (empty = keep current). Markdown or HTML. Vikunja stores HTML: plain lines are kept as lines, '- ' lines become a list"),
     start_date: str = Field(default="", description="Event start time (ISO format) - sets DTSTART in calendar feed (empty = keep current)"),
     end_date: str = Field(default="", description="Event end time (ISO format) - sets DTEND in calendar feed (empty = keep current)"),
     due_date: str = Field(default="", description="Due date in ISO format - for deadlines (empty = keep current)"),
@@ -2924,12 +2942,7 @@ def _add_comment_impl(task_id: int, comment_text: str, author_name: str = None,
         Created comment dict
     """
     # Security: Sanitize comment text (escape HTML before markdown)
-    if _is_html(comment_text):
-        # Already HTML, pass through
-        data = {"comment": comment_text}
-    else:
-        # Sanitize and convert markdown to HTML
-        data = {"comment": md_to_html(_sanitize_description(comment_text))}
+    data = {"comment": _description_html(comment_text)}
 
     # Note: author_name is not directly supported by Vikunja API
     # Comments are always created by the authenticated user
@@ -2975,10 +2988,7 @@ def _update_comment_impl(task_id: int, comment_id: int, comment_text: str,
     Returns:
         Updated comment dict
     """
-    if _is_html(comment_text):
-        data = {"comment": comment_text}
-    else:
-        data = {"comment": md_to_html(_sanitize_description(comment_text))}
+    data = {"comment": _description_html(comment_text)}
     response = _request("POST", f"/api/v1/tasks/{task_id}/comments/{comment_id}",
                         json=data, instance=instance)
     return _format_comment(response)
@@ -4509,7 +4519,7 @@ def _batch_create_tasks_impl(
     Task schema:
     {
         "title": str,              # required
-        "description": str,        # optional
+        "description": str,        # optional; Markdown or HTML (Vikunja stores HTML; lines are kept)
         "start_date": str,         # optional, ISO format (calendar DTSTART)
         "end_date": str,           # optional, ISO format (calendar DTEND)
         "due_date": str,           # optional, ISO format (for deadlines)
@@ -4967,7 +4977,7 @@ def _batch_update_tasks_impl(updates: list[dict]) -> dict:
             if "title" in update:
                 current["title"] = update["title"]
             if "description" in update:
-                current["description"] = md_to_html(update["description"])
+                current["description"] = _description_html(update["description"])
             if "start_date" in update:
                 current["start_date"] = update["start_date"]
             if "end_date" in update:

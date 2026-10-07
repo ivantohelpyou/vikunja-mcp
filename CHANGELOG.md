@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.10.1 (unreleased)
+
+### Fixed — descriptions an agent writes as plain lines show as lines
+
+Found in a real setup run (2026-10-07). Vikunja stores descriptions and comments as HTML.
+Plain text went through Markdown with no extensions, so single line breaks merged into one
+run-on paragraph, a "- item" list straight after a line of text was not a list, and a line
+after a list joined its last item. Project descriptions were sent with no conversion at all,
+and `batch_update_tasks` converted without escaping HTML first. Now every description and
+comment write goes through one helper: HTML passes through; anything else is escaped, then
+converted with line breaks kept and lists separated from the text around them. The tool
+parameters say "Markdown or HTML. Vikunja stores HTML".
+
 ## 0.10.0
 
 The first release carrying the **reckoning** — the deterministic engine for deciding
