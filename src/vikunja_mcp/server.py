@@ -3463,7 +3463,8 @@ def _column_specs(configs: list) -> list[dict]:
     A missing title is passed on as None, for the caller's per-column error handling.
     """
     configs = [{"title": c} if isinstance(c, str) else dict(c) for c in configs or []]
-    top = max((c.get("position") or 0 for c in configs), default=0)
+    # A position that isn't a number goes to Vikunja as given (it decides), and sets no ceiling.
+    top = max((c["position"] for c in configs if isinstance(c.get("position"), (int, float))), default=0)
     return [{"title": c.get("title"), "position": c.get("position") or top + (i + 1) * 1000,
              "limit": c.get("limit", 0)} for i, c in enumerate(configs)]
 

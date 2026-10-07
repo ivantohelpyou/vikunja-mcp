@@ -815,3 +815,9 @@ class TestColumnOrder:
         assert any("Bucket 'None'" in e for e in summary["errors"])
         assert {"A", "B"} <= {t for _, t, _ in fake_vikunja.buckets}
 
+    def test_a_non_numeric_position_does_not_stop_the_others(self):
+        from vikunja_mcp import server
+        specs = server._column_specs([{"title": "A", "position": "5"}, "B", {"title": "C", "position": 7000}])
+        assert [s["title"] for s in specs] == ["A", "B", "C"]
+        assert specs[0]["position"] == "5" and specs[1]["position"] == 7000 + 2000
+
