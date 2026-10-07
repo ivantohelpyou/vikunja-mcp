@@ -949,6 +949,29 @@ class TestViewFilters:
         server._create_bucket_filtered_kanban_impl(3, "By label", {"Kept": "labels in 27"})
         body = next(b for m, ep, b in calls if m == "PUT" and ep.endswith("/views"))
         assert body["bucket_configuration"] == [{"title": "Kept", "filter": {"filter": "labels in 27"}}]
+        assert body["bucket_configuration_mode"] == "filter"
+        assert not [ep for m, ep, b in calls if ep.endswith("/buckets")], "no per-column PUTs"
+
+    def test_a_title_only_update_leaves_the_filter_alone(self, monkeypatch):
+        f = {"s": "", "filter": "labels in 27", "filter_include_nulls": False}
+        server, calls = self._record(monkeypatch, {"id": 13, "title": "Keep", "view_kind": "kanban", "filter": f})
+        server._update_view_impl(3, 13, title="Keepers")
+        body = next(b for m, ep, b in calls if m == "POST")
+        assert body["title"] == "Keepers" and body["filter"] == f
+
+    def test_an_empty_filter_clears_it(self, monkeypatch):
+        server, calls = self._record(monkeypatch, {"id": 13, "title": "Keep", "view_kind": "kanban",
+                                                   "filter": {"filter": "labels in 27"}})
+        server._update_view_impl(3, 13, filter_query="")
+        assert next(b for m, ep, b in calls if m == "POST")["filter"] == {"filter": ""}
+
+    def test_view_create_tool_makes_a_project_view_even_with_a_bucket_mode(self, monkeypatch):
+        server, calls = self._record(monkeypatch)
+        fn = getattr(server.view_create, "fn", server.view_create)
+        fn(project_id=3, title="Keep", view_kind="kanban", filter_query="labels in 27", bucket_config_mode="manual")
+        assert not [ep for m, ep, b in calls if ep.endswith("/filters")], "no saved filter"
+        body = next(b for m, ep, b in calls if m == "PUT" and ep == "/api/v1/projects/3/views")
+        assert body["filter"] == {"filter": "labels in 27"} and body["bucket_configuration_mode"] == "manual"
 
     def test_saved_filter_is_an_object_and_its_project_id_is_negative(self, monkeypatch):
         server, calls = self._record(monkeypatch)
@@ -956,4 +979,19 @@ class TestViewFilters:
         body = next(b for m, ep, b in calls if m == "PUT" and ep.endswith("/filters"))
         assert body["filters"] == {"filter": "labels in 27"}
         assert any(ep == "/api/v1/projects/-10/views" for m, ep, b in calls)   # filter id 9 -> project -10
+
+    def test_a_new_kanban_keeps_its_default_column(self, monkeypatch):
+        from vikunja_mcp import server
+        calls = []
+        def record(method, endpoint, **kw):
+            calls.append((method, endpoint))
+            if method == "GET" and endpoint.endswith("/views"):
+                return []
+            if method == "GET" and endpoint.endswith("/buckets"):
+                return [{"id": 471, "title": "To-Do"}, {"id": 472, "title": "Doing"}, {"id": 473, "title": "Done"}]
+            return {"id": 9, "title": "Keep", "view_kind": "kanban", "default_bucket_id": 471}
+        monkeypatch.setattr(server, "_request", record)
+        server._create_view_impl(3, "Keep", "kanban", filter_query="labels in 27")
+        deleted = [ep.rsplit("/", 1)[1] for m, ep in calls if m == "DELETE"]
+        assert deleted == ["472", "473"]   # the default column stays, so matching cards have a place
 

@@ -13,6 +13,11 @@ on the view (`bucket_configuration`); filters set on single columns were ignored
 `create_filtered_view` (a saved filter) sends the object and finds its view under the saved
 filter's project id, -(id + 1). Checked live on Vikunja 2.2.0.
 
+`view_create` always makes a view on the project. It used to send any call with a filter and
+a bucket mode to a cross-project saved filter instead, and its docstring told agents to pass
+one. A new Kanban view now keeps Vikunja's default column and deletes the others: deleting
+all of them left the view with no default column, so a filtered view showed no cards.
+
 ## 0.10.1
 
 ### Fixed — descriptions an agent writes as plain lines show as lines

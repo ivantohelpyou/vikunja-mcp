@@ -3515,7 +3515,7 @@ def _delete_bucket_impl(project_id: int, view_id: int, bucket_id: int) -> dict:
     return {"deleted": True, "bucket_id": bucket_id}
 
 
-def _create_view_impl(project_id: int, title: str, view_kind: str, filter_query: str = None, delete_default_buckets: bool = True) -> dict:
+def _create_view_impl(project_id: int, title: str, view_kind: str, filter_query: str = None, delete_default_buckets: bool = True, bucket_config_mode: str = "") -> dict:
     """Create a new view for a project.
 
     Args:
@@ -3540,7 +3540,7 @@ def _create_view_impl(project_id: int, title: str, view_kind: str, filter_query:
     # Without this, Vikunja defaults to "none" which groups by labels,
     # causing each task to appear as its own column instead of in buckets
     if view_kind == "kanban":
-        data["bucket_configuration_mode"] = "manual"
+        data["bucket_configuration_mode"] = bucket_config_mode or "manual"
 
     # Vikunja 2.x takes a view's filter as an object, {"filter": "<query>"}; a bare string is a 400
     if filter_query:
@@ -3549,14 +3549,17 @@ def _create_view_impl(project_id: int, title: str, view_kind: str, filter_query:
     response = _request("PUT", f"/api/v1/projects/{project_id}/views", json=data)
     view_id = response.get("id")
 
-    # For kanban views, Vikunja auto-creates default To-Do/Doing/Done buckets.
-    # Delete them if delete_default_buckets is True (default) so user can create custom buckets.
+    # For kanban views, Vikunja auto-creates default To-Do/Doing/Done buckets. Delete all but
+    # the view's default bucket: Vikunja refuses to delete the last one, and with the default gone
+    # no task has a column, so a filtered Keep view showed no cards at all. The kept one can be
+    # renamed, and further columns added with kanban_create_bucket.
     if view_kind == "kanban" and delete_default_buckets and view_id:
         try:
+            default_id = response.get("default_bucket_id")
             buckets = _request("GET", f"/api/v1/projects/{project_id}/views/{view_id}/buckets")
             for bucket in buckets:
                 bucket_id = bucket.get("id")
-                if bucket_id:
+                if bucket_id and bucket_id != default_id:
                     try:
                         _request("DELETE", f"/api/v1/projects/{project_id}/views/{view_id}/buckets/{bucket_id}")
                     except Exception:
@@ -4158,17 +4161,17 @@ def view_create(
     bucket_config_mode: str = Field(default="", description="Bucket mode for kanban: 'manual' (default for kanban) or 'none'. Ignored for non-kanban views.")
 ) -> dict:
     """
-    Create a new view for a project with optional filter.
+    Create a new view on this project, with an optional filter: the view shows only this
+    project's tasks that match (e.g. a "Keep" Kanban: 'labels in 27 && done = false').
 
     Filter syntax: SQL-like queries with fields like done, priority, dueDate, labels.
     Examples: 'done = false', 'priority >= 3 && done = false', 'labels in 7350'
     Date math: now, now+1d, now/w (start of week)
 
-    For filtered kanban views, use bucket_config_mode='manual' (default).
+    A new Kanban view starts with Vikunja's default columns; add the ones you want with
+    kanban_create_bucket.
     """
-    if filter_query and bucket_config_mode:
-        return _create_filtered_view_impl(project_id, title, view_kind, filter_query, bucket_config_mode)
-    return _create_view_impl(project_id, title, view_kind, filter_query)
+    return _create_view_impl(project_id, title, view_kind, filter_query, bucket_config_mode=bucket_config_mode)
 
 
 @mcp.tool()
