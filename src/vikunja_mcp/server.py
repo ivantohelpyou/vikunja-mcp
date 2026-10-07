@@ -2246,22 +2246,23 @@ class _AppendPositions:
         (seen live on 2.2.0: the 25th and 60th of a batch, every time). Read the columns back
         once and re-send each card whose position changed; the second time it stays in order.
         sent: task id -> the position sent. Returns how many were re-sent."""
-        resent = 0
+        moved = {}
         try:
-            for page in range(1, 101):
+            for page in range(1, 101):   # read every page first: re-sending while paging shifts cards
                 cols = _request("GET", f"/api/v1/projects/{project_id}/views/{view_id}/tasks?page={page}") or []
                 for col in cols:
                     for t in col.get("tasks") or []:
                         want = sent.get(t.get("id"))
                         if want is not None and abs((t.get("position") or 0) - want) > 1e-6:
-                            _request("POST", f"/api/v1/tasks/{t['id']}/position",
-                                     json={"project_view_id": view_id, "task_id": t["id"], "position": want})
-                            resent += 1
+                            moved[t["id"]] = want
                 if not any(len(c.get("tasks") or []) >= 50 for c in cols):
                     break
+            for task_id, want in moved.items():
+                _request("POST", f"/api/v1/tasks/{task_id}/position",
+                         json={"project_view_id": view_id, "task_id": task_id, "position": want})
         except Exception:
             pass   # a best-effort pass; the cards are already placed
-        return resent
+        return len(moved)
 
 
 def _set_task_position_impl(
@@ -3794,10 +3795,11 @@ def _setup_kanban_board_impl(
                                      "project_view_id": view_id, "project_id": project_id})
 
                         # Step 2: Commit position, below the column's last card
+                        spot = order.next(bucket_id)
                         _request("POST", f"/api/v1/tasks/{task['id']}/position",
-                                json={"project_view_id": view_id, "task_id": task["id"],
-                                      "position": migrated.setdefault(task["id"], order.next(bucket_id))})
+                                json={"project_view_id": view_id, "task_id": task["id"], "position": spot})
 
+                        migrated[task["id"]] = spot
                         tasks_migrated += 1
                         migration_summary[bucket_title] = migration_summary.get(bucket_title, 0) + 1
                     except Exception:
@@ -3816,6 +3818,8 @@ def _setup_kanban_board_impl(
         "tasks_migrated": tasks_migrated,
         "migration_summary": migration_summary
     }
+    if order is not None and order.warning:
+        result["errors"] = [order.warning]
 
     if project_created:
         result["project_id"] = project_id
@@ -3956,15 +3960,16 @@ def _bulk_set_task_positions_impl(
         position = assignment.get("position")   # given: used; else below the column's last card
 
         try:
-            sent[task_id] = position if position is not None else order.next(bucket_id)
+            spot = position if position is not None else order.next(bucket_id)
             _set_task_position_impl(
                 task_id=task_id,
                 project_id=project_id,
                 view_id=view_id,
                 bucket_id=bucket_id,
                 apply_sort=False,
-                position=sent[task_id]
+                position=spot
             )
+            sent[task_id] = spot
             results.append({"task_id": task_id, "bucket_id": bucket_id, "success": True})
         except Exception as e:
             errors.append({"task_id": task_id, "bucket_id": bucket_id, "error": str(e)})
@@ -4800,9 +4805,9 @@ def _batch_create_tasks_impl(
                 bucket_id = bucket_map.get(bucket_name)
                 if bucket_id:
                     try:
-                        sent[created_task["id"]] = order.next(bucket_id)
-                        _set_task_position_impl(created_task["id"], project_id, view_id, bucket_id,
-                                                position=sent[created_task["id"]])
+                        spot = order.next(bucket_id)
+                        _set_task_position_impl(created_task["id"], project_id, view_id, bucket_id, position=spot)
+                        sent[created_task["id"]] = spot
                     except Exception as e:
                         result["errors"].append(f"Failed to set bucket for task {created_task['id']}: {str(e)}")
                 else:
@@ -5415,8 +5420,9 @@ def _move_tasks_by_label_impl(project_id: int, label_filter: str, view_id: int, 
 
     for task in tasks:
         try:
-            sent[task["id"]] = order.next(bucket_id)
-            _set_task_position_impl(task["id"], project_id, view_id, bucket_id, position=sent[task["id"]])
+            spot = order.next(bucket_id)
+            _set_task_position_impl(task["id"], project_id, view_id, bucket_id, position=spot)
+            sent[task["id"]] = spot
             result["moved"] += 1
             result["tasks"].append({"id": task["id"], "title": task["title"]})
         except Exception as e:
