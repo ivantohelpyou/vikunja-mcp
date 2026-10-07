@@ -1009,3 +1009,43 @@ class TestViewFilters:
         server._create_view_impl(3, "Keep", "kanban")
         assert [ep.rsplit("/", 1)[1] for m, ep in calls if m == "DELETE"] == ["472", "473"]
 
+
+
+# ============================================================================
+# Card order. Found on the NUC setup run (2026-10-07): cards created in order (a timeline) came
+# out reversed, because a placement with no position puts the newest card on top.
+# ============================================================================
+
+
+class TestCardOrder:
+    def _record(self, monkeypatch, existing=None):
+        from vikunja_mcp import server
+        calls = []
+        def record(method, endpoint, **kw):
+            calls.append((method, endpoint, kw.get("json") or {}))
+            if method == "GET" and endpoint.endswith("/views/9/tasks"):
+                return existing or []
+            return {"id": len(calls) + 100, "title": (kw.get("json") or {}).get("title", "t")}
+        monkeypatch.setattr(server, "_request", record)
+        return server, calls
+
+    def _positions(self, calls):
+        return [(b["task_id"], b["position"]) for m, ep, b in calls if ep.endswith("/position")]
+
+    def test_assign_without_positions_appends_in_order(self, monkeypatch):
+        existing = [{"id": 5, "tasks": [{"id": 1, "position": 4000}]}, {"id": 6, "tasks": []}]
+        server, calls = self._record(monkeypatch, existing)
+        server._bulk_set_task_positions_impl(3, 9, [{"task_id": 11, "bucket_id": 5}, {"task_id": 12, "bucket_id": 5},
+                                                    {"task_id": 13, "bucket_id": 6}])
+        assert self._positions(calls) == [(11, 5000), (12, 6000), (13, 1000)]
+
+    def test_assign_uses_a_given_position(self, monkeypatch):
+        server, calls = self._record(monkeypatch)
+        server._bulk_set_task_positions_impl(3, 9, [{"task_id": 11, "bucket_id": 5, "position": 250}])
+        assert self._positions(calls) == [(11, 250)]
+
+    def test_set_task_position_without_a_position_sends_none(self, monkeypatch):
+        server, calls = self._record(monkeypatch)
+        server._set_task_position_impl(11, 3, 9, 5)
+        body = next(b for m, ep, b in calls if ep.endswith("/position"))
+        assert "position" not in body

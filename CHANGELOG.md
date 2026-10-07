@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.10.3 (unreleased)
+
+### Fixed — cards placed in bulk keep the order they were given
+
+Found in a real setup run (2026-10-07): a meal plan's timeline came out backwards in its
+column (5:55 PM above 1:45 PM). Every placement left the position to Vikunja, which puts the
+newest card on top. Now `batch_create_tasks`, `batch_assign_buckets`,
+`batch_label_to_buckets`, moving tasks by label and `kanban_setup`'s task migration place
+each card below the column's last card, in the order given. `batch_assign_buckets` also
+uses a position you give it, which it used to ignore. Columns that `batch_create_tasks`
+creates for you come in the order first used, after the existing ones.
+
 ## 0.10.2
 
 ### Fixed — filtered views, filter columns and saved filters work on Vikunja 2.x

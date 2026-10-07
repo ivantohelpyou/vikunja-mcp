@@ -2212,17 +2212,38 @@ def _batch_delete_tasks_impl(task_ids: list[int]) -> dict:
     }
 
 
+class _AppendPositions:
+    """Positions for cards placed one after another: each new card in a column goes below the
+    column's last card. Without a position Vikunja puts the newest card on top, so cards
+    created in order (a timeline, steps) read backwards. One GET of the view, up front."""
+
+    def __init__(self, project_id: int, view_id: int):
+        self.top = {}
+        try:
+            for col in _request("GET", f"/api/v1/projects/{project_id}/views/{view_id}/tasks") or []:
+                spots = [t.get("position") or 0 for t in col.get("tasks") or []]
+                self.top[col.get("id")] = max(spots, default=0)
+        except Exception:
+            pass   # an empty view, or none yet: start at the top of each column
+
+    def next(self, bucket_id: int) -> float:
+        self.top[bucket_id] = self.top.get(bucket_id, 0) + 1000
+        return self.top[bucket_id]
+
+
 def _set_task_position_impl(
     task_id: int,
     project_id: int,
     view_id: int,
     bucket_id: int,
-    apply_sort: bool = False
+    apply_sort: bool = False,
+    position: float = None
 ) -> dict:
     """
     Move a task to a kanban bucket.
 
-    If apply_sort=True, calculates the correct position based on the bucket's
+    position puts it at that spot in the column (see _AppendPositions); without one, Vikunja
+    puts it on top. If apply_sort=True, calculates the correct position based on the bucket's
     sort strategy from project config (instead of just appending).
     """
     # Add task to bucket
@@ -2243,6 +2264,8 @@ def _set_task_position_impl(
         "project_view_id": view_id,
         "task_id": task_id
     }
+    if position is not None:
+        position_data["position"] = position
     _request("POST", f"/api/v1/tasks/{task_id}/position", json=position_data)
     result = {"task_id": task_id, "bucket_id": bucket_id, "view_id": view_id, "position_set": True}
 
@@ -3710,6 +3733,7 @@ def _setup_kanban_board_impl(
 
     # 7. Migrate tasks if requested
     tasks_migrated = 0
+    order = _AppendPositions(project_id, view_id) if migrate_tasks else None
     migration_summary = {}
 
     if migrate_tasks:
@@ -3735,9 +3759,10 @@ def _setup_kanban_board_impl(
                                 json={"task_id": task["id"], "bucket_id": bucket_id,
                                      "project_view_id": view_id, "project_id": project_id})
 
-                        # Step 2: Commit position
+                        # Step 2: Commit position, below the column's last card
                         _request("POST", f"/api/v1/tasks/{task['id']}/position",
-                                json={"project_view_id": view_id, "task_id": task["id"]})
+                                json={"project_view_id": view_id, "task_id": task["id"],
+                                      "position": order.next(bucket_id)})
 
                         tasks_migrated += 1
                         migration_summary[bucket_title] = migration_summary.get(bucket_title, 0) + 1
@@ -3883,20 +3908,21 @@ def _bulk_set_task_positions_impl(
     
     results = []
     errors = []
-    
+    order = _AppendPositions(project_id, view_id)
+
     for assignment in assignments:
         task_id = assignment["task_id"]
         bucket_id = assignment["bucket_id"]
-        position = assignment.get("position")
-        
+        position = assignment.get("position")   # given: used; else below the column's last card
+
         try:
-            # Use existing set_task_position implementation
             _set_task_position_impl(
                 task_id=task_id,
                 project_id=project_id,
                 view_id=view_id,
                 bucket_id=bucket_id,
-                apply_sort=False
+                apply_sort=False,
+                position=position if position is not None else order.next(bucket_id)
             )
             results.append({"task_id": task_id, "bucket_id": bucket_id, "success": True})
         except Exception as e:
@@ -4617,15 +4643,16 @@ def _batch_create_tasks_impl(
 
             # Create missing buckets if enabled
             if create_missing_buckets:
-                needed_buckets = set()
+                needed_buckets = {}   # in first-use order (a set came out in any order)
                 for task in tasks:
                     bucket_name = task.get("bucket")
                     if bucket_name and bucket_name not in bucket_map:
-                        needed_buckets.add(bucket_name)
+                        needed_buckets[bucket_name] = None
 
+                after = max((b.get("position") or 0 for b in existing_buckets), default=0)
                 for i, bucket_name in enumerate(needed_buckets):
                     try:
-                        new_bucket = _create_bucket_impl(project_id, view_id, bucket_name, position=len(existing_buckets) + i)
+                        new_bucket = _create_bucket_impl(project_id, view_id, bucket_name, position=after + (i + 1) * 1000)
                         bucket_map[bucket_name] = new_bucket["id"]
                     except Exception as e:
                         result["errors"].append(f"Failed to create bucket '{bucket_name}': {str(e)}")
@@ -4718,15 +4745,17 @@ def _batch_create_tasks_impl(
             else:
                 result["errors"].append(f"Unknown ref '{parent_ref}' in subtask_of for task {task_id}")
 
-    # Step 8: Set bucket positions
+    # Step 8: Set bucket positions, in the order given (each below the column's last card)
     if view_id and bucket_map:
+        order = _AppendPositions(project_id, view_id)
         for task_input, created_task in created_tasks:
             bucket_name = task_input.get("bucket")
             if bucket_name:
                 bucket_id = bucket_map.get(bucket_name)
                 if bucket_id:
                     try:
-                        _set_task_position_impl(created_task["id"], project_id, view_id, bucket_id)
+                        _set_task_position_impl(created_task["id"], project_id, view_id, bucket_id,
+                                                position=order.next(bucket_id))
                     except Exception as e:
                         result["errors"].append(f"Failed to set bucket for task {created_task['id']}: {str(e)}")
                 else:
@@ -5329,10 +5358,11 @@ def _move_tasks_by_label_impl(project_id: int, label_filter: str, view_id: int, 
     """Move all tasks matching a label filter to a bucket."""
     tasks = _list_tasks_impl(project_id, include_completed=False, label_filter=label_filter)
     result = {"moved": 0, "tasks": [], "errors": []}
+    order = _AppendPositions(project_id, view_id)
 
     for task in tasks:
         try:
-            _set_task_position_impl(task["id"], project_id, view_id, bucket_id)
+            _set_task_position_impl(task["id"], project_id, view_id, bucket_id, position=order.next(bucket_id))
             result["moved"] += 1
             result["tasks"].append({"id": task["id"], "title": task["title"]})
         except Exception as e:
