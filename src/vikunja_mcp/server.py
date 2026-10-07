@@ -1366,6 +1366,11 @@ def _export_all_projects_impl(include_comments: bool = False) -> dict:
             for v in views_raw:
                 view_data = _format_view(v)
                 if v.get("view_kind") == "kanban":
+                    # which column marks a task done (0 = none) and where new tasks land: the
+                    # import maps them to the new columns (it used to make the LAST column the
+                    # done column, so every task there arrived ticked done)
+                    view_data["done_bucket_id"] = v.get("done_bucket_id") or 0
+                    view_data["default_bucket_id"] = v.get("default_bucket_id") or 0
                     try:
                         # Use the tasks-in-view endpoint — it returns bucket objects with tasks
                         # nested. The dedicated /buckets endpoint returns 401 on some instances.
@@ -1446,6 +1451,20 @@ def _topological_sort_projects(projects: list[dict]) -> list[dict]:
         visit(p["id"])
 
     return result
+
+
+_LABEL_FILTER = re.compile(r"(\blabels\s*(?:not\s+in|in|!=|=)\s*)([0-9][0-9,\s]*)", re.I)
+
+
+def _remap_filter_labels(filt: str, label_id_map: dict) -> str:
+    """A view filter names labels by id ("labels in 26 && done = false"); on another instance
+    those ids are other labels or none. Rewrite each to the imported label's id."""
+    def swap(m):
+        ids = [x.strip() for x in m.group(2).split(",") if x.strip()]
+        new = [str(label_id_map.get(int(x), x)) for x in ids]
+        trail = " " if m.group(2).endswith(" ") else ""
+        return m.group(1) + ", ".join(new) + trail
+    return _LABEL_FILTER.sub(swap, filt or "")
 
 
 def _import_all_projects_impl(export_data: dict, dry_run: bool = False) -> dict:
@@ -1531,6 +1550,14 @@ def _import_all_projects_impl(export_data: dict, dry_run: bool = False) -> dict:
             continue
 
         # ── Step 3: Views + buckets ───────────────────────────────────────────
+        # Vikunja gives every new project four views (List, Gantt, Table, Kanban). An exported
+        # view with the same title and kind takes one of those over instead of adding a second
+        # copy beside it (the import used to leave each one twice).
+        try:
+            auto_views = {(v["title"], v.get("view_kind")): v for v in
+                          (_request("GET", f"/api/v1/projects/{new_project_id}/views") or [])}
+        except Exception:
+            auto_views = {}
         for view in project.get("views", []):
             try:
                 view_payload: dict = {
@@ -1538,13 +1565,18 @@ def _import_all_projects_impl(export_data: dict, dry_run: bool = False) -> dict:
                     "view_kind": view.get("view_kind", "list"),
                 }
                 if view.get("filter"):
-                    # Vikunja expects filter as a plain string (e.g., "done = false").
-                    # If the exported filter is a dict (old format), extract the string.
                     filt = view["filter"]
                     if isinstance(filt, dict):
                         filt = filt.get("filter", "")
-                    view_payload["filter"] = filt
-                new_view = _request("PUT", f"/api/v1/projects/{new_project_id}/views", json=view_payload)
+                    # Vikunja 2.x takes the filter as an object; a plain string is refused (400),
+                    # which lost every filtered view. Label ids in it are the source's: remap.
+                    view_payload["filter"] = {"filter": _remap_filter_labels(filt, label_id_map)}
+                reuse = auto_views.pop((view["title"], view.get("view_kind", "list")), None)
+                if reuse:
+                    new_view = _request("POST", f"/api/v1/projects/{new_project_id}/views/{reuse['id']}",
+                                        json={**reuse, **view_payload})
+                else:
+                    new_view = _request("PUT", f"/api/v1/projects/{new_project_id}/views", json=view_payload)
                 new_view_id = new_view["id"]
                 summary["views_created"] += 1
 
@@ -1579,16 +1611,30 @@ def _import_all_projects_impl(export_data: dict, dry_run: bool = False) -> dict:
                             summary["errors"].append(f"Bucket '{bucket['title']}': {e}")
 
                     # Switch to manual mode and set default/done buckets so tasks
-                    # render as cards rather than column headers (v2.0+ requirement)
+                    # render as cards rather than column headers (v2.0+ requirement). The done
+                    # column is the source's own, or none: forcing the last column made every
+                    # task in it arrive done.
                     if new_bucket_ids:
                         try:
-                            _request("POST", f"/api/v1/projects/{new_project_id}/views/{new_view_id}", json={
+                            kanban_payload = {
                                 "title": view["title"],
                                 "view_kind": "kanban",
                                 "bucket_configuration_mode": "manual",
-                                "default_bucket_id": new_bucket_ids[0],
-                                "done_bucket_id": new_bucket_ids[-1],
-                            })
+                                "default_bucket_id": bucket_id_map.get(view.get("default_bucket_id") or 0, new_bucket_ids[0]),
+                                "done_bucket_id": bucket_id_map.get(view.get("done_bucket_id") or 0, 0),
+                            }
+                            if view_payload.get("filter"):
+                                kanban_payload["filter"] = view_payload["filter"]
+                            _request("POST", f"/api/v1/projects/{new_project_id}/views/{new_view_id}", json=kanban_payload)
+                        except Exception:
+                            pass
+                        # A reused default Kanban keeps its "Done" column until it is no longer
+                        # the done column (Vikunja refuses to delete it before): remove the
+                        # default columns that are still there now.
+                        try:
+                            for b in (_request("GET", f"/api/v1/projects/{new_project_id}/views/{new_view_id}/buckets") or []):
+                                if b["id"] not in new_bucket_ids:
+                                    _request("DELETE", f"/api/v1/projects/{new_project_id}/views/{new_view_id}/buckets/{b['id']}")
                         except Exception:
                             pass
             except Exception as e:
@@ -1597,10 +1643,11 @@ def _import_all_projects_impl(export_data: dict, dry_run: bool = False) -> dict:
         # ── Step 4: Tasks ─────────────────────────────────────────────────────
         for task in project.get("tasks", []):
             try:
-                # Prefer view-specific bucket assignment (from task_ids in bucket export)
-                # over the task's own bucket_id (which may be 0 for custom kanban views)
-                new_bucket_id = (view_task_bucket.get(task["id"])
-                                 or bucket_id_map.get(task.get("bucket_id", 0), 0))
+                # A task the per-view pass below assigns is NOT also placed here: creating it in
+                # its bucket and then assigning it to that bucket again made Vikunja list it twice
+                # in the column. Only an old export with no per-view task_ids uses bucket_id.
+                new_bucket_id = (0 if task["id"] in view_task_bucket
+                                 else bucket_id_map.get(task.get("bucket_id", 0), 0))
                 task_data = {
                     "title": task["title"],
                     "description": task.get("description", ""),
@@ -1641,7 +1688,9 @@ def _import_all_projects_impl(export_data: dict, dry_run: bool = False) -> dict:
 
                 # Comments
                 for comment in task.get("comments", []):
-                    text = comment.get("text", "")
+                    # the export writes "comment" (_format_comment); "text" kept for old exports.
+                    # Reading only "text" dropped every comment, silently.
+                    text = comment.get("comment") or comment.get("text", "")
                     if text:
                         try:
                             _request("PUT", f"/api/v1/tasks/{new_task_id}/comments",

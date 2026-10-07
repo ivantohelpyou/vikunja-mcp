@@ -563,3 +563,140 @@ class TestSmokeTest:
         assert len(list_tool_names()) == 81
         assert _format_task({"id": 1, "title": "Test"})["title"] == "Test"
         assert _format_project({"id": 1, "title": "Test"})["title"] == "Test"
+
+
+# ============================================================================
+# IMPORT FIDELITY (2026-10-06): an export of a board, imported, must come back the same.
+# Found pushing a PDD board between instances: comments dropped, the last Kanban column's
+# tasks ticked done, filtered views refused, every default view doubled.
+# ============================================================================
+
+
+class FakeVikunja:
+    """Just enough of Vikunja for _import_all_projects_impl: ids, views, buckets, calls."""
+
+    def __init__(self):
+        self.calls, self.next = [], 1000
+        self.views = {}   # project id -> [view dicts]
+        self.done = {}    # task id -> done
+        self.buckets = [] # (endpoint, title, new id), in the order made
+
+    def nid(self):
+        self.next += 1
+        return self.next
+
+    def request(self, method, endpoint, **kw):
+        body = kw.get("json") or {}
+        self.calls.append((method, endpoint, body))
+        parts = endpoint.strip("/").split("/")[2:]   # after api/v1
+        if method == "PUT" and parts == ["labels"]:
+            self.label_id = self.nid()
+            return {"id": self.label_id, "title": body["title"]}
+        if method == "PUT" and parts == ["projects"]:
+            pid = self.nid()
+            self.views[pid] = [{"id": self.nid(), "title": t, "view_kind": k, "project_id": pid}
+                               for t, k in (("List", "list"), ("Gantt", "gantt"), ("Table", "table"), ("Kanban", "kanban"))]
+            return {"id": pid, "title": body["title"]}
+        if parts[:1] == ["projects"] and parts[2:] == ["views"] and method == "GET":
+            return list(self.views[int(parts[1])])
+        if parts[:1] == ["projects"] and parts[2:] == ["views"] and method == "PUT":
+            v = {"id": self.nid(), **body}
+            self.views[int(parts[1])].append(v)
+            return v
+        if parts[:1] == ["projects"] and len(parts) == 4 and parts[2] == "views" and method == "POST":
+            return {"id": int(parts[3]), **body}
+        if parts[-1] == "buckets" and method == "GET":
+            return []
+        if parts[-1] == "buckets" and method == "PUT":
+            bid = self.nid()
+            self.buckets.append((endpoint, body["title"], bid))
+            return {"id": bid, **body}
+        if parts[:1] == ["projects"] and parts[-1] == "tasks" and method == "PUT":
+            tid = self.nid()
+            self.done[tid] = body.get("done", False)
+            return {"id": tid, **body}
+        return {}
+
+
+@pytest.fixture
+def fake_vikunja(monkeypatch):
+    from vikunja_mcp import server
+    fake = FakeVikunja()
+    monkeypatch.setattr(server, "_request", fake.request)
+    monkeypatch.setattr(server, "_fetch_all_pages", lambda *a, **k: [])
+    return fake
+
+
+def _board_export():
+    """One board: a filtered List, a Kanban with no done column (A, B; task 2 in B, the
+    LAST column), a Keep view filtered by label 26, and a comment on task 1."""
+    return {
+        "labels": [{"id": 26, "title": "keep", "hex_color": "047857"}],
+        "projects": [{
+            "id": 7, "title": "Saturday night", "parent_project_id": 0,
+            "views": [
+                {"id": 1, "title": "List", "view_kind": "list", "filter": "done = false"},
+                {"id": 2, "title": "Kanban", "view_kind": "kanban", "done_bucket_id": 0, "default_bucket_id": 0,
+                 "buckets": [{"id": 31, "title": "A", "task_ids": [1]}, {"id": 32, "title": "B", "task_ids": [2]}]},
+                {"id": 3, "title": "Keep", "view_kind": "kanban", "filter": "labels in 26 && done = false",
+                 "done_bucket_id": 0, "buckets": [{"id": 41, "title": "A", "task_ids": [1]}]},
+            ],
+            "tasks": [
+                {"id": 1, "title": "Elliott Bay", "done": False, "labels": [{"id": 26}],
+                 "comments": [{"id": 9, "comment": "<p><b>Keep</b></p><p>Serves: walkable</p>"}]},
+                {"id": 2, "title": "Oddfellows", "done": False, "labels": []},
+            ],
+        }],
+    }
+
+
+class TestImportFidelity:
+    def test_comments_written_by_the_export_are_imported(self, fake_vikunja):
+        from vikunja_mcp.server import _import_all_projects_impl
+        out = _import_all_projects_impl(_board_export())
+        posted = [b["comment"] for m, e, b in fake_vikunja.calls if m == "PUT" and e.endswith("/comments")]
+        assert posted == ["<p><b>Keep</b></p><p>Serves: walkable</p>"]
+        assert out["comments_created"] == 1
+
+    def test_no_done_column_unless_the_source_had_one(self, fake_vikunja):
+        from vikunja_mcp.server import _import_all_projects_impl
+        _import_all_projects_impl(_board_export())
+        kanban_cfg = [b for m, e, b in fake_vikunja.calls
+                      if m == "POST" and "/views/" in e and b.get("bucket_configuration_mode") == "manual"]
+        assert kanban_cfg and all(b["done_bucket_id"] == 0 for b in kanban_cfg)
+        assert not any(fake_vikunja.done.values())   # nothing arrived ticked done
+
+    def test_a_source_done_column_maps_to_its_copy(self, fake_vikunja):
+        from vikunja_mcp.server import _import_all_projects_impl
+        data = _board_export()
+        data["projects"][0]["views"][1]["done_bucket_id"] = 31   # column A was the done column
+        _import_all_projects_impl(data)
+        cfg = next(b for m, e, b in fake_vikunja.calls
+                   if m == "POST" and b.get("title") == "Kanban" and "done_bucket_id" in b)
+        kanban_a = next(bid for e, t, bid in fake_vikunja.buckets if t == "A")   # Kanban's columns come first
+        assert cfg["done_bucket_id"] == kanban_a
+
+    def test_filters_go_as_objects_with_label_ids_remapped(self, fake_vikunja):
+        from vikunja_mcp.server import _import_all_projects_impl
+        out = _import_all_projects_impl(_board_export())
+        sent = [b["filter"] for m, e, b in fake_vikunja.calls if "/views" in e and b.get("filter")]
+        assert sent and all(isinstance(f, dict) for f in sent)
+        keep = [f["filter"] for f in sent if "labels" in f["filter"]]
+        assert keep and all(f == f"labels in {fake_vikunja.label_id} && done = false" for f in keep)
+        assert out["errors"] == []
+
+    def test_default_views_are_reused_not_doubled(self, fake_vikunja):
+        from vikunja_mcp.server import _import_all_projects_impl
+        _import_all_projects_impl(_board_export())
+        views = next(iter(fake_vikunja.views.values()))
+        titles = sorted(v["title"] for v in views)
+        assert titles == ["Gantt", "Kanban", "Keep", "List", "Table"]   # one each; Keep added
+
+    def test_remap_filter_labels(self):
+        from vikunja_mcp.server import _remap_filter_labels
+        m = {26: 501, 27: 502}
+        assert _remap_filter_labels("labels in 26 && done = false", m) == "labels in 501 && done = false"
+        assert _remap_filter_labels("labels in 26, 27", m) == "labels in 501, 502"
+        assert _remap_filter_labels("labels != 27", m) == "labels != 502"
+        assert _remap_filter_labels("done = false", m) == "done = false"
+        assert _remap_filter_labels("labels in 99", m) == "labels in 99"   # unknown: left as is

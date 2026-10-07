@@ -8,6 +8,26 @@ source it was generated from.
 
 **This release renames every tool.** If you are on 0.9.3, read §Migration.
 
+### Fixed — `project_import` brings a board back as it was
+
+Found pushing a board between two instances (2026-10-06). Each of these lost data
+silently, with no error:
+
+- **Comments were dropped.** The export writes each comment as `comment`; the import read
+  `text`, found nothing, and skipped every one. It reads `comment` now (`text` still works).
+- **Tasks in a board's last column arrived done.** The import made every Kanban's last
+  column its done column. The export now records each view's done and default column, and
+  the import maps them; no done column unless the source had one.
+- **Filtered views were refused.** Filters went as a plain string (Vikunja 2.x wants an
+  object, `400`), and label ids in them (`labels in 26`) were the source's. Both fixed.
+- **Every default view came twice.** A new project already has List, Gantt, Table and
+  Kanban; an exported view of the same title and kind now takes that one over.
+- A reused default Kanban's leftover "Done" column is removed once it is no longer the done
+  column; a task the per-view pass assigns is no longer also placed at creation.
+
+Known: on a 41-card board one card (the first created) can still be listed twice in its
+column; a race with Vikunja's own background placement. Nothing is lost.
+
 ### Added — the `today_*` family
 
 Vikunja stores tasks; it has no opinion about which of them matters this morning. These
