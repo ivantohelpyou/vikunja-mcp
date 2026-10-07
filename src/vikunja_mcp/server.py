@@ -3542,9 +3542,9 @@ def _create_view_impl(project_id: int, title: str, view_kind: str, filter_query:
     if view_kind == "kanban":
         data["bucket_configuration_mode"] = "manual"
 
-    # Add filter if provided (Vikunja expects filter as a string, not an object)
+    # Vikunja 2.x takes a view's filter as an object, {"filter": "<query>"}; a bare string is a 400
     if filter_query:
-        data["filter"] = filter_query
+        data["filter"] = {"filter": filter_query}
 
     response = _request("PUT", f"/api/v1/projects/{project_id}/views", json=data)
     view_id = response.get("id")
@@ -3587,16 +3587,20 @@ def _delete_view_impl(project_id: int, view_id: int) -> dict:
 
 
 def _update_view_impl(project_id: int, view_id: int, title: str = None, filter_query: str = None) -> dict:
-    """Update a view's title and/or filter."""
-    data = {}
-    
+    """Update a view's title and/or filter.
+
+    Vikunja replaces the whole view on POST, so the current view is read first and only the
+    given fields change (a partial body would blank the title or the kind). The filter goes
+    as an object, {"filter": "<query>"}; "" clears it.
+    """
+    data = dict(_request("GET", f"/api/v1/projects/{project_id}/views/{view_id}") or {})
+
     if title is not None:
         data["title"] = title
-    
-    # Vikunja expects filter as a string, not an object
+
     if filter_query is not None:
-        data["filter"] = filter_query
-    
+        data["filter"] = {"filter": filter_query}
+
     response = _request("POST", f"/api/v1/projects/{project_id}/views/{view_id}", json=data)
     return _format_view(response)
 
@@ -4040,9 +4044,9 @@ def _create_filtered_view_impl(
     """
     Create a filtered view using saved filter (shows only tasks matching criteria).
     
-    Note: Vikunja doesn't support filters on regular views. Instead, this creates
-    a "saved filter" which is actually a virtual project that shows filtered tasks.
-    The saved filter automatically gets a default view of the specified kind.
+    This creates a "saved filter": a virtual project (id -(filter id + 1)) that shows the
+    matching tasks across projects, with its default view set to the given kind. For a
+    filter on one project's own view, use view_create with filter_query instead.
     
     Args:
         project_id: Parent project ID (for context, saved filters are cross-project)
@@ -4057,23 +4061,22 @@ def _create_filtered_view_impl(
     # Create saved filter (this creates a virtual project)
     filter_data = {
         "title": title,
-        "filters": filter_query
+        "filters": {"filter": filter_query}   # an object in Vikunja 2.x; a bare string is a 400
     }
-    
+
     saved_filter = _request("PUT", "/api/v1/filters", json=filter_data)
-    
-    # The saved filter is now a project - update its default view to the desired kind
-    filter_project_id = saved_filter["id"]
+
+    # The saved filter shows up as a project whose id is -(filter id + 1)
+    filter_project_id = -saved_filter["id"] - 1
     views = _request("GET", f"/api/v1/projects/{filter_project_id}/views")
-    
+
     if views:
-        # Update the first view to the desired kind and bucket mode
+        # Update the first view to the desired kind and bucket mode; Vikunja replaces the
+        # whole view on POST, so send the view with only those two fields changed
         default_view = views[0]
-        _request("POST", f"/api/v1/projects/{filter_project_id}/views/{default_view['id']}", 
-                json={
-                    "view_kind": view_kind,
-                    "bucket_configuration_mode": bucket_config_mode
-                })
+        _request("POST", f"/api/v1/projects/{filter_project_id}/views/{default_view['id']}",
+                json={**default_view, "view_kind": view_kind,
+                      "bucket_configuration_mode": bucket_config_mode})
     
     return {
         "id": saved_filter["id"],
@@ -4107,36 +4110,20 @@ def _create_bucket_filtered_kanban_impl(
     existing_views = _request("GET", f"/api/v1/projects/{project_id}/views")
     max_position = max([v.get("position", 0) for v in existing_views], default=0)
     
-    # Create view with filter-based bucket configuration
+    # In Vikunja 2.x a filter-mode Kanban keeps its columns on the view itself, as
+    # bucket_configuration [{title, filter: {filter: <query>}}]; a filter set on a bucket is ignored
     view_data = {
         "title": title,
         "view_kind": "kanban",
         "position": max_position + 100,
-        "bucket_configuration_mode": "filter"
+        "bucket_configuration_mode": "filter",
+        "bucket_configuration": [{"title": t, "filter": {"filter": q}} for t, q in bucket_filters.items()],
     }
-    
+
     new_view = _request("PUT", f"/api/v1/projects/{project_id}/views", json=view_data)
     view_id = new_view["id"]
-    
-    # Create buckets with filters
-    buckets = []
-    position = 100
-    for bucket_title, filter_query in bucket_filters.items():
-        bucket_data = {
-            "title": bucket_title,
-            "limit": 0,
-            "position": position,
-            "filter": filter_query
-        }
-        bucket = _request("PUT", f"/api/v1/projects/{project_id}/views/{view_id}/buckets", 
-                         json=bucket_data)
-        buckets.append({
-            "id": bucket["id"],
-            "title": bucket["title"],
-            "filter": filter_query
-        })
-        position += 100
-    
+    buckets = [{"title": t, "filter": q} for t, q in bucket_filters.items()]
+
     return {
         "id": view_id,
         "title": new_view["title"],

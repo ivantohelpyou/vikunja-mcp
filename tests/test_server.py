@@ -908,3 +908,52 @@ class TestDescriptionHtml:
                 if m in ("PUT", "POST") and (b.get("description") or b.get("comment"))]
         assert len(sent) == 7, sent
         assert all("<br" in d for d in sent), sent
+
+
+# ============================================================================
+# View filters. Found in the PDD setup test on the NUC (2026-10-07, fa-2rag finding 5): a Keep
+# view with a label filter was a 400, because Vikunja 2.x takes a filter as an object.
+# ============================================================================
+
+
+class TestViewFilters:
+    def _record(self, monkeypatch, view=None):
+        from vikunja_mcp import server
+        calls = []
+        def record(method, endpoint, **kw):
+            calls.append((method, endpoint, kw.get("json")))
+            if method == "GET" and endpoint.endswith("/views"):
+                return [view or {"id": 5, "title": "List", "view_kind": "list", "position": 100}]
+            if method == "GET" and "/views/" in endpoint:
+                return dict(view or {})
+            return {"id": 9, "title": (kw.get("json") or {}).get("title", "t"), "view_kind": "kanban"}
+        monkeypatch.setattr(server, "_request", record)
+        return server, calls
+
+    def test_view_create_sends_the_filter_as_an_object(self, monkeypatch):
+        server, calls = self._record(monkeypatch)
+        server._create_view_impl(3, "Keep", "kanban", filter_query="labels in 27 && done = false", delete_default_buckets=False)
+        body = next(b for m, ep, b in calls if m == "PUT" and ep.endswith("/views"))
+        assert body["filter"] == {"filter": "labels in 27 && done = false"}
+
+    def test_view_update_keeps_the_rest_of_the_view(self, monkeypatch):
+        view = {"id": 13, "title": "Keep", "view_kind": "kanban", "bucket_configuration_mode": "manual", "position": 300}
+        server, calls = self._record(monkeypatch, view)
+        server._update_view_impl(3, 13, filter_query="labels in 27")
+        body = next(b for m, ep, b in calls if m == "POST")
+        assert body["filter"] == {"filter": "labels in 27"}
+        assert body["title"] == "Keep" and body["view_kind"] == "kanban" and body["bucket_configuration_mode"] == "manual"
+
+    def test_filter_columns_live_on_the_view(self, monkeypatch):
+        server, calls = self._record(monkeypatch)
+        server._create_bucket_filtered_kanban_impl(3, "By label", {"Kept": "labels in 27"})
+        body = next(b for m, ep, b in calls if m == "PUT" and ep.endswith("/views"))
+        assert body["bucket_configuration"] == [{"title": "Kept", "filter": {"filter": "labels in 27"}}]
+
+    def test_saved_filter_is_an_object_and_its_project_id_is_negative(self, monkeypatch):
+        server, calls = self._record(monkeypatch)
+        server._create_filtered_view_impl(3, "Keepers", "kanban", "labels in 27")
+        body = next(b for m, ep, b in calls if m == "PUT" and ep.endswith("/filters"))
+        assert body["filters"] == {"filter": "labels in 27"}
+        assert any(ep == "/api/v1/projects/-10/views" for m, ep, b in calls)   # filter id 9 -> project -10
+

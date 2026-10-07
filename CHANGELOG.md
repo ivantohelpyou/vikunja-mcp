@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.10.2
+
+### Fixed — filtered views, filter columns and saved filters work on Vikunja 2.x
+
+Found in a real setup run (2026-10-07): a Keep view filtered by label (`labels in 27 &&
+done = false`) was refused with a 400. Vikunja 2.x takes a filter as an object,
+`{"filter": "<query>"}`, and four places sent a bare string. `view_create` and `view_update`
+send the object, and `view_update` reads the view first, because Vikunja replaces the whole
+view on update and a partial body blanked the rest. A filter-column Kanban keeps its columns
+on the view (`bucket_configuration`); filters set on single columns were ignored.
+`create_filtered_view` (a saved filter) sends the object and finds its view under the saved
+filter's project id, -(id + 1). Checked live on Vikunja 2.2.0.
+
 ## 0.10.1
 
 ### Fixed — descriptions an agent writes as plain lines show as lines
