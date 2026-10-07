@@ -339,6 +339,11 @@ def _decrypt_api_key(encrypted: str) -> Optional[str]:
         return None
 
 
+_SAFE_OPENING_TAG = re.compile(
+    r"<(?:strong|b|em|i|u|s|a|br|hr|pre|code|span|small|mark|sup|sub|dl|section|article)\b[^>]*>",
+    re.IGNORECASE)
+
+
 def _is_html(text: str) -> bool:
     """Check if text appears to be HTML (not markdown).
 
@@ -349,10 +354,16 @@ def _is_html(text: str) -> bool:
     stripped = text.strip()
     html_starts = ('<p>', '<p ', '<div>', '<div ', '<ul>', '<ol>', '<h1>', '<h2>',
                    '<h3>', '<h4>', '<h5>', '<h6>', '<table>', '<blockquote>', '<!DOCTYPE')
-    return stripped.lower().startswith(html_starts)
+    if stripped.lower().startswith(html_starts):
+        return True
+    # Formatting tags an agent may open with ("<strong>Goal</strong>: ship"). Not script,
+    # style, img or iframe: text opening with those is escaped, as before.
+    return bool(_SAFE_OPENING_TAG.match(stripped))
 
 
 _LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+_LIST_OPENER = re.compile(r"^\s*(?:[-*+]|1[.)])\s+")   # a numbered list starts at 1: "2024. was great" is a line
+_FENCE = re.compile(r"^\s*(```|~~~)")
 
 
 def md_to_html(text: str) -> str:
@@ -368,19 +379,31 @@ def md_to_html(text: str) -> str:
     # If already HTML, don't convert
     if _is_html(text):
         return text
-    lines, prev, in_list = [], "", False
-    for line in text.split("\n"):
+    lines, prev, in_list, in_fence = [], "", False, False
+    for line in text.replace("\r\n", "\n").split("\n"):
+        if _FENCE.match(line):
+            if not in_fence and prev.strip():
+                lines.append("")   # a fence after text needs a blank line too
+            in_fence, in_list = not in_fence, False
+            lines.append(line)
+            prev = line
+            continue
+        if in_fence:   # code: leave it exactly as written
+            lines.append(line)
+            prev = line
+            continue
         item, indented = bool(_LIST_ITEM.match(line)), line.startswith((" ", "\t"))
+        opener = item and not in_list and bool(_LIST_OPENER.match(line))
         # A blank line before a list, and after one: else the next line joins its last item.
-        if prev.strip() and ((item and not in_list) or (in_list and line.strip() and not item and not indented)):
+        if prev.strip() and (opener or (in_list and line.strip() and not item and not indented)):
             lines.append("")
-        if item:
+        if opener or (item and in_list):
             in_list = True
         elif line.strip() and not indented:
             in_list = False
         lines.append(line)
         prev = line
-    return markdown.markdown("\n".join(lines), extensions=["nl2br", "sane_lists"])
+    return markdown.markdown("\n".join(lines), extensions=["nl2br", "sane_lists", "fenced_code"])
 
 
 def _description_html(text: str) -> str:

@@ -850,6 +850,29 @@ class TestDescriptionHtml:
         out = _description_html("Serve with:\n1. rice\n2. slaw\n   (make ahead)\nDone.")
         assert "<ol>" in out and "(make ahead)</li>" in out and "<p>Done.</p>" in out
 
+    def test_a_number_after_text_is_not_a_list(self):
+        from vikunja_mcp.server import _description_html
+        for text in ("Text\n2024. was great", "Meet\n2. later", "Start\n1:30 PM onions"):
+            assert "<ol" not in _description_html(text), text
+        assert "<ol>" in _description_html("Steps:\n1. chop\n2. fry")
+
+    def test_fenced_code_is_left_alone(self):
+        from vikunja_mcp.server import _description_html
+        out = _description_html("Run:\n```\nls\n- a\n```\ndone")
+        assert "<pre><code>" in out and "- a" in out and "<li>" not in out and "<p>done</p>" in out
+
+    def test_windows_line_endings(self):
+        from vikunja_mcp.server import _description_html
+        out = _description_html("Produce:\r\n- onions\r\n- leeks\r\nDone")
+        assert out.count("<li>") == 2 and "<p>Done</p>" in out
+
+    def test_html_opening_with_a_formatting_tag_passes_through(self):
+        from vikunja_mcp.server import _description_html
+        for html in ("<strong>Goal</strong>: ship", "<a href='https://x.org'>x</a> and more", "<pre>x</pre>"):
+            assert _description_html(html) == html, html
+        assert "&lt;script&gt;" in _description_html("<script>alert(1)</script>")
+        assert "&lt;img" in _description_html("<img src=x onerror=alert(1)>")
+
     def test_html_passes_through_untouched(self):
         from vikunja_mcp.server import _description_html
         html = "<p>Starter: <a href='https://en.wikibooks.org/wiki/Cookbook:Hummus'>Hummus</a></p>"
