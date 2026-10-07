@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.10.1 (unreleased)
+## 0.10.1
 
 ### Fixed — descriptions an agent writes as plain lines show as lines
 
