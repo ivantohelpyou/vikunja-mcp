@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.10.3 (unreleased)
+## 0.10.3
 
 ### Fixed — cards placed in bulk keep the order they were given
 
