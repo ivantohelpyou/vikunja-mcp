@@ -10,7 +10,10 @@ newest card on top. Now `batch_create_tasks`, `batch_assign_buckets`,
 `batch_label_to_buckets`, moving tasks by label and `kanban_setup`'s task migration place
 each card below the column's last card, in the order given. `batch_assign_buckets` also
 uses a position you give it, which it used to ignore. Columns that `batch_create_tasks`
-creates for you come in the order first used, after the existing ones.
+creates for you come in the order first used, after the existing ones. Long columns are
+read page by page (Vikunja returns 50 cards a page). Vikunja 2.2.0 itself moves the odd card
+just positioned (the 25th and 60th of a batch, every time), so each bulk placement reads
+the columns back once and re-sends any card that moved; a failed read is reported.
 
 ## 0.10.2
 

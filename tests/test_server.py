@@ -1023,8 +1023,11 @@ class TestCardOrder:
         calls = []
         def record(method, endpoint, **kw):
             calls.append((method, endpoint, kw.get("json") or {}))
-            if method == "GET" and endpoint.endswith("/views/9/tasks"):
-                return existing or []
+            if method == "GET" and "/views/9/tasks?page=" in endpoint:
+                page = int(endpoint.rsplit("=", 1)[1])
+                return (existing or {}).get(page, []) if isinstance(existing, dict) else (existing or [] if page == 1 else [])
+            if method == "GET" and endpoint.endswith("/buckets"):
+                return []
             return {"id": len(calls) + 100, "title": (kw.get("json") or {}).get("title", "t")}
         monkeypatch.setattr(server, "_request", record)
         return server, calls
@@ -1049,3 +1052,70 @@ class TestCardOrder:
         server._set_task_position_impl(11, 3, 9, 5)
         body = next(b for m, ep, b in calls if ep.endswith("/position"))
         assert "position" not in body
+
+    def test_cards_being_placed_do_not_count_as_the_last_card(self, monkeypatch):
+        existing = [{"id": 5, "tasks": [{"id": 1, "position": 2000}, {"id": 11, "position": 4_000_000_000}]}]
+        server, calls = self._record(monkeypatch, existing)
+        server._bulk_set_task_positions_impl(3, 9, [{"task_id": 11, "bucket_id": 5}])
+        assert self._positions(calls)[0] == (11, 3000)   # after card 1, not after its own auto spot
+
+    def test_every_page_is_read(self, monkeypatch):
+        page1 = [{"id": 5, "tasks": [{"id": i, "position": i * 10} for i in range(1, 51)]}]
+        page2 = [{"id": 5, "tasks": [{"id": 99, "position": 9000}]}]
+        server, calls = self._record(monkeypatch, {1: page1, 2: page2})
+        server._bulk_set_task_positions_impl(3, 9, [{"task_id": 200, "bucket_id": 5}])
+        assert self._positions(calls) == [(200, 10000)]
+
+    def test_a_failed_read_is_reported(self, monkeypatch):
+        from vikunja_mcp import server
+        def fail(method, endpoint, **kw):
+            if method == "GET":
+                raise ValueError("502 Bad Gateway")
+            return {}
+        monkeypatch.setattr(server, "_request", fail)
+        out = server._bulk_set_task_positions_impl(3, 9, [{"task_id": 11, "bucket_id": 5}])
+        assert any("current order" in (e.get("error") or "") for e in out["errors"])
+
+    def test_missing_columns_come_in_first_use_order_after_the_others(self, monkeypatch):
+        from vikunja_mcp import server
+        made = []
+        monkeypatch.setattr(server, "_request", lambda m, ep, **kw: [] if m == "GET" else {"id": 1})
+        monkeypatch.setattr(server, "_get_kanban_view_impl", lambda pid: {"id": 9}, raising=False)
+        monkeypatch.setattr(server, "_list_buckets_impl", lambda pid, vid: [{"id": 1, "title": "Shopping", "position": 5000}])
+        def create_bucket(pid, vid, title, position=0, limit=0):
+            made.append((title, position)); return {"id": len(made) + 10, "title": title}
+        monkeypatch.setattr(server, "_create_bucket_impl", create_bucket)
+        server._batch_create_tasks_impl(3, [{"title": "a", "bucket": "Timings"}, {"title": "b", "bucket": "Serving"},
+                                            {"title": "c", "bucket": "Timings"}], create_missing_buckets=True)
+        assert made == [("Timings", 6000), ("Serving", 7000)]
+
+    def test_a_card_vikunja_moved_is_sent_again_once(self, monkeypatch):
+        from vikunja_mcp import server
+        calls, reads = [], []
+        def record(method, endpoint, **kw):
+            calls.append((method, endpoint, kw.get("json") or {}))
+            if method == "GET" and "/views/9/tasks?page=1" in endpoint:
+                reads.append(1)
+                # first read: empty column; read-back: Vikunja put card 12 somewhere else
+                return [] if len(reads) == 1 else [{"id": 5, "tasks": [{"id": 11, "position": 1000},
+                                                                         {"id": 12, "position": 1797569}]}]
+            if method == "GET":
+                return []
+            return {}
+        monkeypatch.setattr(server, "_request", record)
+        server._bulk_set_task_positions_impl(3, 9, [{"task_id": 11, "bucket_id": 5}, {"task_id": 12, "bucket_id": 5}])
+        assert self._positions(calls) == [(11, 1000), (12, 2000), (12, 2000)]
+
+    def test_nothing_is_sent_again_when_every_card_stayed(self, monkeypatch):
+        from vikunja_mcp import server
+        calls, reads = [], []
+        def record(method, endpoint, **kw):
+            calls.append((method, endpoint, kw.get("json") or {}))
+            if method == "GET" and "/views/9/tasks?page=1" in endpoint:
+                reads.append(1)
+                return [] if len(reads) == 1 else [{"id": 5, "tasks": [{"id": 11, "position": 1000}]}]
+            return [] if method == "GET" else {}
+        monkeypatch.setattr(server, "_request", record)
+        server._bulk_set_task_positions_impl(3, 9, [{"task_id": 11, "bucket_id": 5}])
+        assert self._positions(calls) == [(11, 1000)]
+
