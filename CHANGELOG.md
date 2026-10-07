@@ -17,6 +17,8 @@ filter's project id, -(id + 1). Checked live on Vikunja 2.2.0.
 a bucket mode to a cross-project saved filter instead, and its docstring told agents to pass
 one. A new Kanban view now keeps Vikunja's default column and deletes the others: deleting
 all of them left the view with no default column, so a filtered view showed no cards.
+No tool creates a cross-project saved filter any more: `view_create` only reached one by
+accident (a filter plus a bucket mode), and project views take filters themselves.
 
 ## 0.10.1
 

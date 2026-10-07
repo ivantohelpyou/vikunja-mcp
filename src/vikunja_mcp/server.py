@@ -3557,6 +3557,8 @@ def _create_view_impl(project_id: int, title: str, view_kind: str, filter_query:
         try:
             default_id = response.get("default_bucket_id")
             buckets = _request("GET", f"/api/v1/projects/{project_id}/views/{view_id}/buckets")
+            if not default_id and buckets:   # not reported: keep the first, never delete them all
+                default_id = buckets[0].get("id")
             for bucket in buckets:
                 bucket_id = bucket.get("id")
                 if bucket_id and bucket_id != default_id:

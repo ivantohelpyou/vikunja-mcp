@@ -995,3 +995,17 @@ class TestViewFilters:
         deleted = [ep.rsplit("/", 1)[1] for m, ep in calls if m == "DELETE"]
         assert deleted == ["472", "473"]   # the default column stays, so matching cards have a place
 
+    def test_without_a_reported_default_the_first_column_stays(self, monkeypatch):
+        from vikunja_mcp import server
+        calls = []
+        def record(method, endpoint, **kw):
+            calls.append((method, endpoint))
+            if method == "GET" and endpoint.endswith("/views"):
+                return []
+            if method == "GET" and endpoint.endswith("/buckets"):
+                return [{"id": 471, "title": "To-Do"}, {"id": 472, "title": "Doing"}, {"id": 473, "title": "Done"}]
+            return {"id": 9, "title": "Keep", "view_kind": "kanban"}
+        monkeypatch.setattr(server, "_request", record)
+        server._create_view_impl(3, "Keep", "kanban")
+        assert [ep.rsplit("/", 1)[1] for m, ep in calls if m == "DELETE"] == ["472", "473"]
+
