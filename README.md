@@ -13,7 +13,7 @@ Works with any Vikunja instance: self-hosted, cloud, or
 
 ```bash
 # Claude Desktop config — see Setup below for the full block
-uvx vikunja-mcp@latest
+uvx vikunja-mcp==0.10.3
 ```
 
 Requires a Vikunja instance and an API token. Full configuration in [Setup](#setup).
@@ -119,11 +119,11 @@ pinned there. Lowering them still works. The other seven are unbounded.
 
 **Assignment queue** — `assign_queue`, `assign_apply`
 
-> **Renamed since 0.9.3.** The PyPI release still uses the old flat names. `focus_now`,
+> **Renamed in 0.10.0.** These are the names on PyPI from 0.10.0 on. `focus_now`,
 > `due_today`, `due_this_week`, `overdue_tasks`, `high_priority_tasks`, `urgent_tasks`,
 > `unscheduled_tasks` and `task_summary` are all now modes of a single
 > `task_query(query=...)`; `list_tasks` → `task_list`, `create_task` → `task_create`,
-> `list_projects` → `project_list`, and so on.
+> `list_projects` → `project_list`, and so on. 0.9.x still uses the old flat names.
 
 ---
 
@@ -147,8 +147,8 @@ your Claude Desktop config:
 {
   "mcpServers": {
     "vikunja": {
-      "command": "uvx",
-      "args": ["vikunja-mcp@latest"],
+      "command": "/full/path/to/uvx",
+      "args": ["vikunja-mcp==0.10.3"],
       "env": {
         "VIKUNJA_URL": "https://your-vikunja-instance.com",
         "VIKUNJA_TOKEN": "your-api-token"
@@ -167,8 +167,13 @@ Multiple instances, via `VIKUNJA_INSTANCES` (a JSON array) plus a default:
 }
 ```
 
-> **Tip:** `vikunja-mcp@latest` always resolves to the newest release. After upgrading,
-> quit Claude Desktop fully and run `uv cache prune` if you still see the old tools.
+> **Use the full path to `uvx`.** Desktop apps don't see your shell's `PATH`, so a bare
+> `"uvx"` often fails to start. Find it with `command -v uvx` (macOS / Linux) or
+> `(Get-Command uvx).Source` (Windows — double the backslashes in JSON).
+>
+> **Pin the version.** `vikunja-mcp==0.10.3` runs the same tools every time; to upgrade,
+> change the pin, quit Claude Desktop fully, and reopen it. `vikunja-mcp@latest` also works
+> but changes the tool surface under you whenever a release lands.
 
 | OS | Config file |
 |----|-------------|
@@ -215,16 +220,17 @@ upstream and re-extracted. Issues against everything else are normal PRs.
 
 ## Troubleshooting
 
-**Tools don't appear.** Check the config file is valid JSON, that `uv` is on your PATH,
-and that Claude Desktop was fully quit rather than just closed.
+**Tools don't appear.** Check the config file is valid JSON, that `uv` is installed,
+that `command` is the full path to `uvx` rather than a bare `"uvx"`, and that Claude
+Desktop was fully quit rather than just closed.
 
 **"VIKUNJA_URL and VIKUNJA_TOKEN environment variables are required."** The `env` block
 is missing or misspelled.
 
 **401 Unauthorized.** The token was revoked or expired — issue a new one.
 
-**Still on an old version.** Use `vikunja-mcp@latest`, then `uv cache prune` with Claude
-Desktop closed.
+**Still on an old version.** Check the pin in `args` (`vikunja-mcp==<version>`). If it is
+right and the old tools still appear, run `uv cache prune` with Claude Desktop closed.
 
 ## Requirements
 
